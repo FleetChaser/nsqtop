@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nsq-top"
+version = "0.1.0"
+description = "A top-like monitoring tool for NSQ clusters"
+requires-python = ">=3.8"
+dependencies = [
+    "requests",
+    "blessed",
+]
+
+[project.scripts]
+nsq-top = "nsq_top:main"
+
+[tool.uv]
+dev-dependencies = []
