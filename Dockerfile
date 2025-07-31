@@ -1,21 +1,37 @@
-FROM python:3.12-slim
-
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
-
-# Install terminfo files
-RUN apt-get update && apt-get install -y ncurses-term && rm -rf /var/lib/apt/lists/*
+# Build stage
+FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
-COPY pyproject.toml .
-COPY README.md .
-COPY nsq_top.py .
 
-# Install dependencies using uv
-RUN uv sync --python $(which python)
+# Install git (needed for go mod download with some modules)
+RUN apk add --no-cache git
 
-# Add the virtual environment to PATH so we can use python directly
-ENV PATH="/app/.venv/bin:$PATH"
+# Copy go mod files
+COPY go.mod go.sum ./
 
-# Your command to run the script
-CMD ["python", "nsq_top.py"]
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY main.go ./
+
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o nsqtop .
+
+# Final stage
+FROM alpine:latest
+
+# Install ca-certificates for HTTPS requests and ncurses-terminfo for terminal support
+RUN apk --no-cache add ca-certificates ncurses-terminfo-base
+
+WORKDIR /root/
+
+# Copy the binary from builder stage
+COPY --from=builder /app/nsqtop .
+
+# Create a non-root user
+RUN adduser -D -s /bin/sh nsquser
+USER nsquser
+
+# Set the binary as the entrypoint
+ENTRYPOINT ["./nsqtop"]

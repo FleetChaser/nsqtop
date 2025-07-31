@@ -1,120 +1,175 @@
-# nsq_top
+# NSQTop
 
-A `top`-like monitoring tool for NSQ clusters that provides real-time visibility into NSQ topics, channels, and message flow.
+A `top`-like monitoring tool for NSQ clusters, built in Go with a rich terminal interface.
 
 ## Features
 
-- Real-time monitoring of NSQ clusters
-- Support for multiple nsqlookupd servers for high availability
-- Visual sparkline charts showing in-flight message trends
-- Color-coded backlog depth indicators
-- Interactive terminal UI with live updates
+- **Real-time monitoring**: Live updates of NSQ cluster statistics
+- **Rich terminal UI**: Table-based display with color coding and sparkline trends
+- **Multi-server support**: Monitor multiple nsqlookupd and nsqd instances
+- **Rate tracking**: Display both per-second and per-minute message rates
+- **Cross-platform**: Available for Linux, macOS, and Windows
+- **Docker support**: Pre-built Docker images available
 
-## Building the Docker Image
+## Installation
 
-To build the Docker image, run the following command from this directory:
+### Download Binary
+
+Download the latest release for your platform from the [releases page](../../releases):
 
 ```bash
-docker build -t nsq_top .
+# Linux x64
+wget https://github.com/FleetChaser/nsqtop/releases/latest/download/nsqtop-linux-amd64.tar.gz
+tar -xzf nsqtop-linux-amd64.tar.gz
+
+# macOS x64
+wget https://github.com/FleetChaser/nsqtop/releases/latest/download/nsqtop-darwin-amd64.tar.gz
+tar -xzf nsqtop-darwin-amd64.tar.gz
+
+# Windows x64
+# Download nsqtop-windows-amd64.zip and extract
 ```
 
-## Running the Container
+### Build from Source
 
-### Using Environment Variables (Recommended)
-
-Configure the container using environment variables for easy deployment:
-
-**Single nsqlookupd server:**
 ```bash
-docker run -it --rm \
-  -e NSQ_LOOKUPD_ADDRESSES=your-nsqlookupd:4161 \
-  nsq_top
+git clone https://github.com/FleetChaser/nsqtop.git
+cd nsqtop
+go build -o nsqtop main.go
 ```
 
-**Multiple nsqlookupd servers (for high availability):**
+### Docker
+
 ```bash
-docker run -it --rm \
-  -e NSQ_LOOKUPD_ADDRESSES=nsqlookupd1:4161,nsqlookupd2:4161,nsqlookupd3:4161 \
-  nsq_top
+# Pull the image
+docker pull ghcr.io/fleetchaser/nsqtop:latest
+
+# Run with docker
+docker run --rm -it ghcr.io/fleetchaser/nsqtop:latest --lookupd-http-address "your-nsqlookupd:4161"
 ```
 
-**With custom refresh interval:**
+## Usage
+
+### Basic Usage
+
 ```bash
-docker run -it --rm \
-  -e NSQ_LOOKUPD_ADDRESSES=your-nsqlookupd:4161 \
-  -e NSQ_TOP_INTERVAL=5 \
-  nsq_top
+# Monitor a single nsqlookupd instance
+./nsqtop --lookupd-http-address localhost:4161
+
+# Monitor multiple nsqlookupd instances
+./nsqtop --lookupd-http-address "localhost:4161,localhost:4162"
+
+# Custom refresh interval (default: 2 seconds)
+./nsqtop --lookupd-http-address localhost:4161 --interval 5
 ```
-
-### Using Command-Line Arguments
-
-You can also pass configuration via command-line arguments:
-
-**Single server:**
-```bash
-docker run -it --rm nsq_top python nsq_top.py --lookupd-http-address your-nsqlookupd:4161
-```
-
-**Multiple servers:**
-```bash
-docker run -it --rm nsq_top python nsq_top.py --lookupd-http-address "nsqlookupd1:4161,nsqlookupd2:4161"
-```
-
-## Configuration Options
 
 ### Environment Variables
 
-- `NSQ_LOOKUPD_ADDRESSES` (required): Comma-separated list of nsqlookupd HTTP addresses (http:// prefix optional)
-- `NSQ_LOOKUPD_ADDRESS` (fallback): Single nsqlookupd HTTP address (for backward compatibility)
-- `NSQ_TOP_INTERVAL` (optional): Refresh interval in seconds. Defaults to `2`
-
-### Command-Line Arguments
-
-- `--lookupd-http-address`: Comma-separated HTTP addresses of nsqlookupd instances (http:// prefix optional)
-- `--interval`: Refresh interval in seconds
-
-## Running Locally (without Docker)
-
-If you have Python and `uv` installed, you can run the tool directly:
+You can also configure nsqtop using environment variables:
 
 ```bash
-# Install dependencies
-uv sync
-
-# Run with environment variables (using uv run)
-NSQ_LOOKUPD_ADDRESSES=localhost:4161 uv run python nsq_top.py
-
-# Or activate the virtual environment and run directly
-source .venv/bin/activate
-NSQ_LOOKUPD_ADDRESSES=localhost:4161 python nsq_top.py
-
-# Or with command-line arguments
-.venv/bin/python nsq_top.py --lookupd-http-address localhost:4161
-
-# Alternative: using uv run (if you prefer)
-uv run python nsq_top.py --lookupd-http-address localhost:4161
+export NSQTOP_LOOKUPD_ADDRESSES="localhost:4161,localhost:4162"
+export NSQTOP_INTERVAL=3
+./nsqtop
 ```
 
-## Docker Compose Example
+### Command Line Options
 
-For easy deployment with NSQ, here's a docker-compose example:
+```
+Usage:
+  nsqtop [flags]
 
-```yaml
-version: '3.8'
-services:
-  nsq_top:
-    build: .
-    environment:
-      - NSQ_LOOKUPD_ADDRESSES=nsqlookupd:4161
-      - NSQ_TOP_INTERVAL=3
-    depends_on:
-      - nsqlookupd
-    tty: true
-    stdin_open: true
+Flags:
+  -h, --help                          help for nsqtop
+  -i, --interval int                  Refresh interval in seconds (default 2)
+  -l, --lookupd-http-address string   Comma-separated HTTP addresses of nsqlookupd instances
 ```
 
-## Requirements
+## Interface
 
-- Python 3.8+
-- Dependencies: `requests`, `blessed`
-- Terminal with color support for best experience
+The terminal interface displays:
+
+- **Header**: Current time and connection status
+- **Summary**: Total in-flight messages, channel count, and trend sparkline
+- **Table**: Detailed statistics for each topic/channel combination
+  - **Topic/Channel**: Name of the topic and channel
+  - **Depth**: Number of queued messages (color-coded by severity)
+  - **In-Flight**: Number of messages currently being processed
+  - **Rate/sec**: Messages processed per second
+  - **Rate/min**: Messages processed per minute
+
+### Color Coding
+
+- **Green**: Normal depth (< 100 messages)
+- **Yellow**: Warning depth (100-999 messages)
+- **Red**: Critical depth (≥ 1000 messages)
+
+## Development
+
+### Prerequisites
+
+- Go 1.21 or later
+- Git
+
+### Building
+
+```bash
+# Get dependencies
+go mod download
+
+# Build for current platform
+go build -o nsqtop main.go
+
+# Build for specific platform
+GOOS=linux GOARCH=amd64 go build -o nsqtop-linux-amd64 main.go
+```
+
+### Testing
+
+```bash
+# Run tests
+go test ./...
+
+# Run with race detection
+go test -race ./...
+
+# Static analysis
+go vet ./...
+staticcheck ./...
+```
+
+## Release Process
+
+This project uses GitHub Actions for automated building and releasing:
+
+1. **Push a tag**: `git tag v1.0.0 && git push origin v1.0.0`
+2. **Automatic build**: GitHub Actions builds binaries for multiple platforms
+3. **Release creation**: A GitHub release is created with downloadable assets
+4. **Docker images**: Multi-architecture Docker images are built and pushed
+
+### Supported Platforms
+
+- Linux (amd64, arm64)
+- macOS (amd64, arm64)
+- Windows (amd64)
+
+## Migration from Python Version
+
+This Go version provides the same functionality as the Python version with these improvements:
+
+- **Better performance**: Native binary with lower resource usage
+- **No dependencies**: Single binary with no external runtime requirements
+- **Faster startup**: Immediate execution without interpreter overhead
+- **Better distribution**: Pre-compiled binaries for all major platforms
+
+## License
+
+This project is open source and available under the [MIT License](LICENSE).
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
