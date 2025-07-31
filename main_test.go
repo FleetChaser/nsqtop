@@ -28,7 +28,7 @@ func TestFormatNumber(t *testing.T) {
 func TestGenerateSparkline(t *testing.T) {
 	tests := []struct {
 		input    []int
-		expected int // length of output
+		expected int // length of output in runes
 	}{
 		{[]int{}, 0},
 		{[]int{1, 2, 3}, 3},
@@ -38,8 +38,26 @@ func TestGenerateSparkline(t *testing.T) {
 
 	for _, test := range tests {
 		result := generateSparkline(test.input)
-		if len(result) != test.expected {
-			t.Errorf("generateSparkline(%v) length = %d; expected %d", test.input, len(result), test.expected)
+		// Count runes, not bytes, since we're using Unicode characters
+		runeCount := len([]rune(result))
+		if runeCount != test.expected {
+			t.Errorf("generateSparkline(%v) rune length = %d; expected %d", test.input, runeCount, test.expected)
+		}
+		
+		// Additional check: ensure we're getting valid sparkline characters
+		if len(test.input) > 0 {
+			for _, r := range result {
+				found := false
+				for _, sparklineRune := range []rune(SparklineChars) {
+					if r == sparklineRune {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("generateSparkline(%v) contains invalid character: %c", test.input, r)
+				}
+			}
 		}
 	}
 }

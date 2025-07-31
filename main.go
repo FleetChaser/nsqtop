@@ -212,7 +212,7 @@ func (n *NSQTop) updateData() {
 	}
 
 	n.app.QueueUpdateDraw(func() {
-		n.updateUI(channels, totalInflight)
+		n.updateUI(channels, totalInflight, nodes)
 	})
 }
 
@@ -238,7 +238,7 @@ func (n *NSQTop) getNSQDNodes() ([]Producer, error) {
 	}
 
 	if len(allProducers) == 0 && len(errors) > 0 {
-		return nil, fmt.Errorf(strings.Join(errors, "; "))
+		return nil, fmt.Errorf("%s", strings.Join(errors, "; "))
 	}
 
 	// Remove duplicates
@@ -336,7 +336,13 @@ func (n *NSQTop) processStats(allStats []StatsResponse) ([]*ChannelData, int) {
 	return channels, totalInflight
 }
 
-func (n *NSQTop) updateUI(channels []*ChannelData, totalInflight int) {
+func (n *NSQTop) updateUI(channels []*ChannelData, totalInflight int, nodes []Producer) {
+	// Calculate total depth
+	totalDepth := 0
+	for _, channel := range channels {
+		totalDepth += channel.Depth
+	}
+
 	// Update summary
 	sparkline := generateSparkline(n.inflightHistory)
 	lookupDisplay := strings.Join(n.lookupURLs, ", ")
@@ -344,14 +350,27 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totalInflight int) {
 		lookupDisplay = fmt.Sprintf("%d servers", len(n.lookupURLs))
 	}
 	
+	// Format nsqd servers list
+	var nsqdServers []string
+	for _, node := range nodes {
+		nsqdServers = append(nsqdServers, fmt.Sprintf("%s:%d", node.BroadcastAddress, node.HTTPPort))
+	}
+	nsqdDisplay := strings.Join(nsqdServers, ", ")
+	if len(nsqdServers) > 3 {
+		nsqdDisplay = fmt.Sprintf("%d nsqd nodes", len(nsqdServers))
+	}
+	
 	summaryText := fmt.Sprintf(
 		"[blue]NSQ Top - %s - Connected to %s[white]\n"+
-		"[yellow]Total In-Flight: %s | Channels: %d | Trend: %s[white]",
+		"[yellow]Total Depth: %s | Total In-Flight: %s | Channels: %d | Trend: %s[white]\n"+
+		"[green]NSQd Servers: %s[white]",
 		time.Now().Format("2006-01-02 15:04:05"),
 		lookupDisplay,
+		formatNumber(totalDepth),
 		formatNumber(totalInflight),
 		len(channels),
 		sparkline,
+		nsqdDisplay,
 	)
 	n.summary.SetText(summaryText)
 
@@ -426,13 +445,16 @@ func generateSparkline(history []int) string {
 		max = 1
 	}
 
+	// Convert string to rune slice to handle Unicode characters properly
+	sparklineRunes := []rune(SparklineChars)
+	
 	var result strings.Builder
 	for _, val := range history {
-		index := (val * (len(SparklineChars) - 1)) / max
-		if index >= len(SparklineChars) {
-			index = len(SparklineChars) - 1
+		index := (val * (len(sparklineRunes) - 1)) / max
+		if index >= len(sparklineRunes) {
+			index = len(sparklineRunes) - 1
 		}
-		result.WriteByte(SparklineChars[index])
+		result.WriteRune(sparklineRunes[index])
 	}
 
 	return result.String()
