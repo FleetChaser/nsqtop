@@ -55,7 +55,7 @@ jobs:
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: binaries
+        name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
         path: |
           nsqtop-*
           *.zip
@@ -72,7 +72,7 @@ jobs:
     - name: Download artifacts
       uses: actions/download-artifact@v4
       with:
-        name: binaries
+        merge-multiple: true
     
     - name: Create Release
       uses: softprops/action-gh-release@v1
