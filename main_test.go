@@ -48,7 +48,7 @@ func TestGenerateSparkline(t *testing.T) {
 		if len(test.input) > 0 {
 			for _, r := range result {
 				found := false
-				for _, sparklineRune := range []rune(SparklineChars) {
+				for _, sparklineRune := range SparklineChars {
 					if r == sparklineRune {
 						found = true
 						break
