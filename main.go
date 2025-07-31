@@ -374,6 +374,17 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totalInflight int, nodes []Pr
 	)
 	n.summary.SetText(summaryText)
 
+	// Sort channels by depth (desc), then in-flight (desc), then rate/min (desc)
+	sort.Slice(channels, func(i, j int) bool {
+		if channels[i].Depth != channels[j].Depth {
+			return channels[i].Depth > channels[j].Depth
+		}
+		if channels[i].InFlightCount != channels[j].InFlightCount {
+			return channels[i].InFlightCount > channels[j].InFlightCount
+		}
+		return channels[i].RatePerMinute > channels[j].RatePerMinute
+	})
+
 	// Update table
 	n.table.Clear()
 
