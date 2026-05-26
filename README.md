@@ -109,8 +109,8 @@ Provide either `--lookupd-http-address` or `--nsqd-http-address`. When nsqd addr
 
 The terminal interface displays:
 
-- **Header**: Current time and connection status
-- **Summary**: Total depth, in-flight messages, channel count, and an in-flight trend sparkline, plus the cluster-wide total message count and global incoming rate (per second and per minute)
+- **Summary**: Total depth, in-flight messages, channel count, the cluster-wide total message count, and the global incoming rate (per second and per minute)
+- **In-Flight Trend**: A full-width sparkline strip (above the table) showing the recent total in-flight history
 - **Table**: Detailed statistics for each topic/channel combination
   - **Topic/Channel**: Name of the topic and channel
   - **Depth**: Number of queued messages (color-coded by severity)
@@ -118,8 +118,10 @@ The terminal interface displays:
   - **In/sec**: Incoming messages per second (rate of messages produced to the topic)
   - **In/min**: Incoming messages per minute
   - **Processed**: Cumulative number of messages the channel has handled
+  - **Timeouts**: Cumulative timed-out messages; shows a `▲<rate>` marker when climbing
+  - **Requeues**: Cumulative requeued messages; shows a `▲<rate>` marker when climbing
 
-The interface uses a dark color scheme.
+Press `/` to filter the table by a topic/channel substring (live; Enter keeps it, Esc clears). The interface uses a dark color scheme.
 
 ### Color Coding
 

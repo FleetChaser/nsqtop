@@ -20,7 +20,8 @@ import (
 // Configuration constants
 const (
 	SparklineChars     = " ▂▃▄▅▆▇█"
-	SparklineLength    = 60
+	SparklineLength    = 60  // fallback trend width before the terminal size is known
+	MaxHistory         = 800 // in-flight samples retained for the trend
 	DepthWarnThreshold = 100
 	DepthCritThreshold = 1000
 	DefaultInterval    = 2 // seconds
@@ -51,6 +52,8 @@ type Channel struct {
 	BackendDepth  int    `json:"backend_depth"`
 	InFlightCount int    `json:"in_flight_count"`
 	MessageCount  int64  `json:"message_count"`
+	TimeoutCount  int64  `json:"timeout_count"`
+	RequeueCount  int64  `json:"requeue_count"`
 }
 
 type Topic struct {
@@ -68,6 +71,7 @@ type StatsResponse struct {
 type Totals struct {
 	Inflight       int
 	MessageCount   int64   // total messages produced across all topics
+	Processed      int64   // total messages processed across all channels
 	IncomingPerSec float64 // smoothed global incoming rate
 }
 
@@ -79,12 +83,19 @@ type ChannelData struct {
 	MessageCount      int64   // cumulative messages processed by the channel
 	IncomingPerSecond float64 // rate of messages produced to the topic
 	IncomingPerMinute float64
+	TimeoutCount      int64
+	RequeueCount      int64
+	TimeoutRate       float64 // smoothed growth per second
+	RequeueRate       float64
 }
 
 type NSQTop struct {
 	app                *tview.Application
 	table              *tview.Table
 	summary            *tview.TextView
+	trend              *tview.TextView
+	filterInput        *tview.InputField
+	flex               *tview.Flex
 	client             *http.Client
 	lookupURLs         []string
 	nsqdURLs           []string
@@ -92,8 +103,18 @@ type NSQTop struct {
 	intervalCh         chan time.Duration // signals the monitor goroutine to retune its ticker
 	previousTopicStats map[string]int64
 	topicRateEMA       map[string]float64 // smoothed incoming rate (msgs/sec) per topic
-	inflightHistory    []int
+	prevTimeoutCount   map[string]int64   // previous timeout_count per topic/channel
+	prevRequeueCount   map[string]int64   // previous requeue_count per topic/channel
+	timeoutRateEMA     map[string]float64 // smoothed timeout growth per topic/channel
+	requeueRateEMA     map[string]float64 // smoothed requeue growth per topic/channel
+	trendHistory       []int              // per-sample traffic (processed this interval + in-flight)
+	prevProcessed      int64              // previous total processed, for the per-interval delta
+	havePrevProcessed  bool
 	scrollTop          bool
+
+	// Topic/channel substring filter, toggled with "/".
+	filtering  bool
+	filterText string
 
 	// Sorting state, driven by the arrow keys.
 	sortColumn int
@@ -107,7 +128,7 @@ type NSQTop struct {
 }
 
 // columnTitles is the table's column order; the sort column index refers to it.
-var columnTitles = []string{"Topic/Channel", "Depth", "In-Flight", "In/sec", "In/min", "Processed"}
+var columnTitles = []string{"Topic/Channel", "Depth", "In-Flight", "In/sec", "In/min", "Processed", "Timeouts", "Requeues"}
 
 const sortColumnDepth = 1
 
@@ -176,7 +197,11 @@ func runNSQTop(cmd *cobra.Command, args []string) {
 		intervalCh:         make(chan time.Duration, 1),
 		previousTopicStats: make(map[string]int64),
 		topicRateEMA:       make(map[string]float64),
-		inflightHistory:    make([]int, 0, SparklineLength),
+		prevTimeoutCount:   make(map[string]int64),
+		prevRequeueCount:   make(map[string]int64),
+		timeoutRateEMA:     make(map[string]float64),
+		requeueRateEMA:     make(map[string]float64),
+		trendHistory:       make([]int, 0, MaxHistory),
 		scrollTop:          true,
 		sortColumn:         sortColumnDepth,
 		sortDesc:           true,
@@ -233,25 +258,71 @@ func (n *NSQTop) initUI() {
 		SetScrollable(false)
 	n.summary.SetBorder(true).SetTitle("NSQ Cluster Status")
 
-	// Create table
+	// Full-width in-flight trend strip, shown right above the table.
+	n.trend = tview.NewTextView().
+		SetDynamicColors(true).
+		SetScrollable(false)
+	n.trend.SetBorder(true).SetTitle("Traffic Trend (processed + in-flight)")
+
+	// Create table. No cell-border grid: rows stay single-spaced (denser), and
+	// the header is distinguished by an underline instead (see updateUI). It
+	// sits in its own bordered box with inner padding so the text isn't flush
+	// against the edge, matching the panels above.
 	n.table = tview.NewTable().
-		SetBorders(true).
+		SetBorders(false).
 		SetSelectable(false, false)
+	n.table.SetBorder(true).SetTitle("Channels").SetBorderPadding(0, 0, 1, 1)
 
-	// Set up layout
-	flex := tview.NewFlex().SetDirection(tview.FlexRow).
+	// Filter bar, hidden (height 0) until "/" is pressed. Live-filters as you
+	// type; Enter keeps the filter, Esc clears it.
+	n.filterInput = tview.NewInputField().SetLabel(" / ")
+	n.filterInput.SetChangedFunc(func(text string) {
+		n.filterText = strings.TrimSpace(text)
+		n.scrollTop = true
+		n.redraw()
+	})
+	n.filterInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			n.filterText = ""
+			n.filterInput.SetText("")
+		}
+		n.stopFilter()
+	})
+
+	// Layout: status panel, full-width trend strip, table, filter bar.
+	n.flex = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(n.summary, 7, 1, false).
-		AddItem(n.table, 0, 1, true)
+		AddItem(n.trend, 3, 1, false).
+		AddItem(n.table, 0, 1, true).
+		AddItem(n.filterInput, 0, 0, false)
 
-	n.app.SetRoot(flex, true).SetFocus(flex)
+	n.app.SetRoot(n.flex, true).SetFocus(n.flex)
 
 	// Key bindings: Ctrl+C quits, Left/Right pick the sort column, Enter
-	// reverses the sort direction. Up/Down (and friends) fall through to the
-	// table so it can still scroll.
+	// reverses the sort direction, -/+ change the refresh rate, "/" filters.
+	// Up/Down (and friends) fall through to the table so it can still scroll.
 	n.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// While typing a filter, let keys reach the input field (its DoneFunc
+		// handles Enter/Esc); only Ctrl+C still quits.
+		if n.filtering {
+			if event.Key() == tcell.KeyCtrlC {
+				n.app.Stop()
+				return nil
+			}
+			return event
+		}
+
 		switch event.Key() {
 		case tcell.KeyCtrlC:
 			n.app.Stop()
+			return nil
+		case tcell.KeyEscape:
+			// Clear an active filter from the table view.
+			if n.filterText != "" {
+				n.filterText = ""
+				n.scrollTop = true
+				n.redraw()
+			}
 			return nil
 		case tcell.KeyLeft:
 			n.changeSortColumn(-1)
@@ -266,6 +337,9 @@ func (n *NSQTop) initUI() {
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
+			case '/': // open the topic/channel filter
+				n.startFilter()
+				return nil
 			case '-', '_': // smaller interval -> faster refresh
 				n.adjustInterval(-IntervalStep)
 				return nil
@@ -276,6 +350,23 @@ func (n *NSQTop) initUI() {
 		}
 		return event
 	})
+}
+
+// startFilter reveals the filter bar and focuses it for input.
+func (n *NSQTop) startFilter() {
+	n.filtering = true
+	n.filterInput.SetText(n.filterText)
+	n.flex.ResizeItem(n.filterInput, 1, 0)
+	n.app.SetFocus(n.filterInput)
+}
+
+// stopFilter hides the filter bar and returns focus to the table.
+func (n *NSQTop) stopFilter() {
+	n.filtering = false
+	n.flex.ResizeItem(n.filterInput, 0, 0)
+	n.app.SetFocus(n.table)
+	n.scrollTop = true
+	n.redraw()
 }
 
 // changeSortColumn moves the active sort column by delta (wrapping around) and
@@ -331,31 +422,67 @@ func (n *NSQTop) redraw() {
 	n.updateUI(n.lastChannels, n.lastTotals, n.lastNodes)
 }
 
-// sortChannels orders channels in place according to the active sort column and
-// direction.
+// sortChannels orders channels in place by the active sort column and
+// direction, with a stable secondary sort on topic/channel name so equal-valued
+// rows keep a consistent order across refreshes instead of jumping around.
 func (n *NSQTop) sortChannels(channels []*ChannelData) {
-	less := func(a, b *ChannelData) bool {
+	name := func(c *ChannelData) string { return c.Topic + "/" + c.Channel }
+
+	// primaryCmp returns -1/0/1 comparing the active column in ascending order.
+	primaryCmp := func(a, b *ChannelData) int {
 		switch n.sortColumn {
 		case 0:
-			return a.Topic+"/"+a.Channel < b.Topic+"/"+b.Channel
+			return strings.Compare(name(a), name(b))
 		case 2:
-			return a.InFlightCount < b.InFlightCount
+			return cmpInt(int64(a.InFlightCount), int64(b.InFlightCount))
 		case 3:
-			return a.IncomingPerSecond < b.IncomingPerSecond
+			return cmpFloat(a.IncomingPerSecond, b.IncomingPerSecond)
 		case 4:
-			return a.IncomingPerMinute < b.IncomingPerMinute
+			return cmpFloat(a.IncomingPerMinute, b.IncomingPerMinute)
 		case 5:
-			return a.MessageCount < b.MessageCount
+			return cmpInt(a.MessageCount, b.MessageCount)
+		case 6:
+			return cmpInt(a.TimeoutCount, b.TimeoutCount)
+		case 7:
+			return cmpInt(a.RequeueCount, b.RequeueCount)
 		default: // Depth
-			return a.Depth < b.Depth
+			return cmpInt(int64(a.Depth), int64(b.Depth))
 		}
 	}
-	sort.SliceStable(channels, func(i, j int) bool {
-		if n.sortDesc {
-			return less(channels[j], channels[i])
+
+	sort.Slice(channels, func(i, j int) bool {
+		a, b := channels[i], channels[j]
+		if c := primaryCmp(a, b); c != 0 {
+			if n.sortDesc {
+				return c > 0
+			}
+			return c < 0
 		}
-		return less(channels[i], channels[j])
+		// Tiebreak by name, always ascending, for a stable order.
+		return name(a) < name(b)
 	})
+}
+
+func cmpInt(a, b int64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func cmpFloat(a, b float64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func (n *NSQTop) startMonitoring() {
@@ -402,10 +529,21 @@ func (n *NSQTop) updateData() {
 
 	channels, totals := n.processStats(allStats)
 
-	// Update inflight history
-	n.inflightHistory = append(n.inflightHistory, totals.Inflight)
-	if len(n.inflightHistory) > SparklineLength {
-		n.inflightHistory = n.inflightHistory[1:]
+	// Trend sample = messages processed during this interval + current in-flight,
+	// so the graph reflects actual traffic rather than just the in-flight gauge
+	// (which stays near zero when consumers keep up).
+	processedThisInterval := int64(0)
+	if n.havePrevProcessed {
+		if d := totals.Processed - n.prevProcessed; d > 0 { // ignore counter resets
+			processedThisInterval = d
+		}
+	}
+	n.prevProcessed = totals.Processed
+	n.havePrevProcessed = true
+
+	n.trendHistory = append(n.trendHistory, totals.Inflight+int(processedThisInterval))
+	if len(n.trendHistory) > MaxHistory {
+		n.trendHistory = n.trendHistory[len(n.trendHistory)-MaxHistory:]
 	}
 
 	n.app.QueueUpdateDraw(func() {
@@ -501,56 +639,82 @@ func (n *NSQTop) processStats(allStats []StatsResponse) ([]*ChannelData, Totals)
 				data.Depth += channel.Depth + channel.BackendDepth
 				data.InFlightCount += channel.InFlightCount
 				data.MessageCount += channel.MessageCount
+				data.TimeoutCount += channel.TimeoutCount
+				data.RequeueCount += channel.RequeueCount
 				totalInflight += channel.InFlightCount
 			}
 		}
 	}
 
-	// Calculate incoming rates from the topic's produced-message counter.
-	// Every message produced to a topic is copied to each of its channels, so
-	// the topic's rate is the incoming rate for all of its channels.
-	//
-	// Each tick's instantaneous rate is fed into an exponential moving average
-	// so the displayed value is a stable running figure rather than a noisy
-	// per-sample reading. An idle topic decays toward (and reads) 0.
-	topicIncoming := make(map[string]float64)
-	for topicName, msgCount := range topicMessages {
-		instant := 0.0
-		if prev, exists := n.previousTopicStats[topicName]; exists {
-			if diff := float64(msgCount - prev); diff > 0 { // ignore counter resets
-				instant = diff / n.getInterval().Seconds()
-			}
-		}
-		if prevEMA, ok := n.topicRateEMA[topicName]; ok {
-			topicIncoming[topicName] = RateEMAAlpha*instant + (1-RateEMAAlpha)*prevEMA
-		} else {
-			topicIncoming[topicName] = instant
-		}
+	// Incoming rate comes from the topic's produced-message counter: every
+	// message produced to a topic is copied to each of its channels, so the
+	// topic's rate is the incoming rate for all of its channels. Timeout and
+	// requeue growth are tracked per channel. All are smoothed (see smoothRates).
+	timeoutCounts := make(map[string]int64, len(channelData))
+	requeueCounts := make(map[string]int64, len(channelData))
+	for key, data := range channelData {
+		timeoutCounts[key] = data.TimeoutCount
+		requeueCounts[key] = data.RequeueCount
 	}
 
+	topicIncoming := n.smoothRates(topicMessages, n.previousTopicStats, n.topicRateEMA)
+	timeoutRates := n.smoothRates(timeoutCounts, n.prevTimeoutCount, n.timeoutRateEMA)
+	requeueRates := n.smoothRates(requeueCounts, n.prevRequeueCount, n.requeueRateEMA)
+
 	// Store current counts and smoothed rates for the next iteration.
-	n.previousTopicStats = topicMessages
-	n.topicRateEMA = topicIncoming
+	n.previousTopicStats, n.topicRateEMA = topicMessages, topicIncoming
+	n.prevTimeoutCount, n.timeoutRateEMA = timeoutCounts, timeoutRates
+	n.prevRequeueCount, n.requeueRateEMA = requeueCounts, requeueRates
 
 	// Cluster-wide totals: sum produced-message counts and smoothed rates.
 	totals := Totals{Inflight: totalInflight}
 	for _, count := range topicMessages {
 		totals.MessageCount += count
 	}
+	for _, data := range channelData {
+		totals.Processed += data.MessageCount
+	}
 	for _, rate := range topicIncoming {
 		totals.IncomingPerSec += rate
 	}
 
-	// Convert to slice and attach each channel's incoming rate. Ordering is
-	// handled later in updateUI based on the active sort column.
+	// Convert to slice and attach each channel's rates. Timeout/requeue counts
+	// are nsqd's cumulative lifetime totals. Ordering is handled later in
+	// updateUI based on the active sort column.
 	var channels []*ChannelData
-	for _, data := range channelData {
+	for key, data := range channelData {
 		data.IncomingPerSecond = topicIncoming[data.Topic]
 		data.IncomingPerMinute = data.IncomingPerSecond * 60
+		data.TimeoutRate = timeoutRates[key]
+		data.RequeueRate = requeueRates[key]
 		channels = append(channels, data)
 	}
 
 	return channels, totals
+}
+
+// smoothRates turns cumulative counters into a per-second growth rate, fed
+// through an exponential moving average so the value is a stable running figure
+// rather than a noisy per-sample reading. Idle counters decay toward (and read)
+// 0; counter resets (negative deltas) are ignored. The returned map becomes the
+// next iteration's EMA state.
+func (n *NSQTop) smoothRates(current, previous map[string]int64, prevEMA map[string]float64) map[string]float64 {
+	seconds := n.getInterval().Seconds()
+	out := make(map[string]float64, len(current))
+	for key, count := range current {
+		instant := 0.0
+		if prev, ok := previous[key]; ok {
+			if diff := float64(count - prev); diff > 0 {
+				instant = diff / seconds
+			}
+		}
+		if ema, ok := prevEMA[key]; ok {
+			out[key] = RateEMAAlpha*instant + (1-RateEMAAlpha)*ema
+		} else {
+			out[key] = instant
+		}
+	}
+	return out
 }
 
 func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []string) {
@@ -561,7 +725,6 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 	}
 
 	// Update summary
-	sparkline := generateSparkline(n.inflightHistory)
 	lookupDisplay := strings.Join(n.lookupURLs, ", ")
 	if len(n.lookupURLs) > 3 {
 		lookupDisplay = fmt.Sprintf("%d servers", len(n.lookupURLs))
@@ -580,22 +743,29 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 		nsqdDisplay = fmt.Sprintf("%d nsqd nodes", len(nsqdServers))
 	}
 
+	// Apply the active substring filter to the displayed rows; cluster-wide
+	// totals above stay global regardless of the filter.
+	display := filterChannels(channels, n.filterText)
+	channelsField := strconv.Itoa(len(channels))
+	if n.filterText != "" {
+		channelsField = fmt.Sprintf("%d/%d matching %q", len(display), len(channels), n.filterText)
+	}
+
 	sortDirArrow := "▲"
 	if n.sortDesc {
 		sortDirArrow = "▼"
 	}
 	summaryText := fmt.Sprintf(
 		"[#7aa2f7]NSQ Top - %s - Connected to %s[-]\n"+
-			"[#e0af68]Total Depth: %s | Total In-Flight: %s | Channels: %d | Trend: %s[-]\n"+
+			"[#e0af68]Total Depth: %s | Total In-Flight: %s | Channels: %s[-]\n"+
 			"[#bb9af7]Total Msgs: %s | Rate: %s/s, %s/m[-]\n"+
 			"[#9ece6a]NSQd Servers: %s[-]\n"+
-			"[#565f89]Sort: %s %s  •  Refresh: %s  •  ←/→ sort  •  Enter reverse  •  − faster / + slower  •  Ctrl+C quit[-]",
+			"[#565f89]Sort: %s %s  •  Refresh: %s  •  / filter  •  ←/→ sort  •  Enter reverse  •  − faster / + slower  •  Ctrl+C quit[-]",
 		time.Now().Format("2006-01-02 15:04:05"),
 		lookupDisplay,
 		formatNumber(totalDepth),
 		formatNumber(totals.Inflight),
-		len(channels),
-		sparkline,
+		channelsField,
 		formatNumber64(totals.MessageCount),
 		formatRate(totals.IncomingPerSec, 1),
 		formatRate(totals.IncomingPerSec*60, 0),
@@ -605,10 +775,22 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 	)
 	n.summary.SetText(summaryText)
 
-	// Sort according to the active column/direction (driven by the arrow keys).
-	n.sortChannels(channels)
+	// Render the in-flight trend across the full width of its panel.
+	trendWidth := SparklineLength
+	if _, _, w, _ := n.trend.GetInnerRect(); w > 0 {
+		trendWidth = w
+	}
+	history := n.trendHistory
+	if len(history) > trendWidth {
+		history = history[len(history)-trendWidth:]
+	}
+	n.trend.SetText("[#7dcfff]" + generateSparkline(history) + "[-]")
 
-	// Remember this snapshot so a key press can re-sort between refresh ticks.
+	// Sort the displayed rows by the active column/direction.
+	n.sortChannels(display)
+
+	// Remember the full (unfiltered) snapshot so a key press can re-sort or
+	// re-filter between refresh ticks.
 	n.lastChannels = channels
 	n.lastTotals = totals
 	n.lastNodes = nodeURLs
@@ -616,21 +798,27 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 	// Update table
 	n.table.Clear()
 
-	// Headers, with an arrow marking the active sort column.
+	// Headers: bold, underlined accent text (no grid). The first column is
+	// left-aligned; numeric columns are right-aligned to sit over their values.
+	// An arrow marks the active sort column.
 	for i, header := range columnTitles {
 		if i == n.sortColumn {
 			header = header + " " + sortDirArrow
 		}
+		align := tview.AlignRight
+		if i == 0 {
+			align = tview.AlignLeft
+		}
 		cell := tview.NewTableCell(header).
-			SetAlign(tview.AlignCenter).
-			SetAttributes(tcell.AttrBold).
-			SetTextColor(colorFg).
-			SetBackgroundColor(colorHeaderBg)
+			SetAlign(align).
+			SetAttributes(tcell.AttrBold | tcell.AttrUnderline).
+			SetTextColor(colorAccent).
+			SetSelectable(false)
 		n.table.SetCell(0, i, cell)
 	}
 
 	// Data rows
-	for i, channel := range channels {
+	for i, channel := range display {
 		row := i + 1
 		topicChannel := fmt.Sprintf("%s/%s", channel.Topic, channel.Channel)
 
@@ -659,6 +847,19 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 
 		// Processed (cumulative messages handled by the channel)
 		n.table.SetCell(row, 5, tview.NewTableCell(formatNumber64(channel.MessageCount)).SetAlign(tview.AlignRight))
+
+		// Timeouts and Requeues, with a ▲rate growth marker when climbing.
+		timeoutCell := tview.NewTableCell(formatGrowth(channel.TimeoutCount, channel.TimeoutRate)).SetAlign(tview.AlignRight)
+		if channel.TimeoutRate >= 0.05 {
+			timeoutCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 6, timeoutCell)
+
+		requeueCell := tview.NewTableCell(formatGrowth(channel.RequeueCount, channel.RequeueRate)).SetAlign(tview.AlignRight)
+		if channel.RequeueRate >= 0.05 {
+			requeueCell.SetTextColor(colorWarn)
+		}
+		n.table.SetCell(row, 7, requeueCell)
 	}
 
 	// Pin the header row so it stays visible while scrolling. Snap to the top
@@ -738,6 +939,32 @@ func formatRate(rate float64, decimals int) string {
 		rate = 0
 	}
 	return strconv.FormatFloat(rate, 'f', decimals, 64)
+}
+
+// formatGrowth renders a cumulative count, appending a "▲<rate>" marker (per
+// second) when the counter is currently climbing.
+func formatGrowth(count int64, rate float64) string {
+	s := formatNumber64(count)
+	if rate >= 0.05 {
+		s += " ▲" + strconv.FormatFloat(rate, 'f', 1, 64)
+	}
+	return s
+}
+
+// filterChannels returns the channels whose "topic/channel" contains query
+// (case-insensitive). An empty query returns the input unchanged.
+func filterChannels(channels []*ChannelData, query string) []*ChannelData {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return channels
+	}
+	var out []*ChannelData
+	for _, c := range channels {
+		if strings.Contains(strings.ToLower(c.Topic+"/"+c.Channel), query) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // normalizeAddresses splits a comma-separated list of host:port addresses,

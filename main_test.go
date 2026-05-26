@@ -147,6 +147,39 @@ func TestAdjustInterval(t *testing.T) {
 	}
 }
 
+func TestFilterChannels(t *testing.T) {
+	channels := []*ChannelData{
+		{Topic: "fc.dvr.Event", Channel: "fleet-worker"},
+		{Topic: "fc.tracker.ProcessReading", Channel: "fleet-worker"},
+		{Topic: "chat.BroadcastMessage", Channel: "chat.instance#ephemeral"},
+	}
+
+	if got := filterChannels(channels, ""); len(got) != 3 {
+		t.Errorf("empty query should return all; got %d", len(got))
+	}
+	if got := filterChannels(channels, "dvr"); len(got) != 1 || got[0].Topic != "fc.dvr.Event" {
+		t.Errorf("query %q did not match expected single channel: %+v", "dvr", got)
+	}
+	if got := filterChannels(channels, "FLEET"); len(got) != 2 { // case-insensitive, matches channel name
+		t.Errorf("case-insensitive query should match 2; got %d", len(got))
+	}
+	if got := filterChannels(channels, "nope"); len(got) != 0 {
+		t.Errorf("non-matching query should return none; got %d", len(got))
+	}
+}
+
+func TestFormatGrowth(t *testing.T) {
+	if got := formatGrowth(1234, 0); got != "1,234" {
+		t.Errorf("idle counter should show plain count, got %q", got)
+	}
+	if got := formatGrowth(1234, 0.01); got != "1,234" {
+		t.Errorf("sub-threshold rate should not show marker, got %q", got)
+	}
+	if got := formatGrowth(1234, 2.5); got != "1,234 ▲2.5" {
+		t.Errorf("growing counter should show marker, got %q", got)
+	}
+}
+
 func TestNormalizeAddresses(t *testing.T) {
 	got := normalizeAddresses(" localhost:4161 , http://h2:4161/ ,, https://h3:4161")
 	want := []string{"http://localhost:4161", "http://h2:4161", "https://h3:4161"}
