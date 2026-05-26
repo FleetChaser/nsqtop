@@ -119,6 +119,15 @@ var (
 )
 
 func main() {
+	// Default to 24-bit color so the dark palette renders accurately. Without
+	// this, tcell downsamples our hex colors to the terminal's ANSI palette,
+	// which themes them unpredictably — notably inside `kubectl run -it` pods
+	// where COLORTERM is unset. Honored only when the user hasn't set it; they
+	// can still opt out with TCELL_TRUECOLOR=disable.
+	if os.Getenv("COLORTERM") == "" {
+		os.Setenv("COLORTERM", "truecolor")
+	}
+
 	var rootCmd = &cobra.Command{
 		Use:   "nsqtop",
 		Short: "A top-like monitoring tool for NSQ clusters",
