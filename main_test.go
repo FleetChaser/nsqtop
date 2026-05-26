@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 )
 
 func TestFormatNumber(t *testing.T) {
@@ -43,7 +44,7 @@ func TestGenerateSparkline(t *testing.T) {
 		if runeCount != test.expected {
 			t.Errorf("generateSparkline(%v) rune length = %d; expected %d", test.input, runeCount, test.expected)
 		}
-		
+
 		// Additional check: ensure we're getting valid sparkline characters
 		if len(test.input) > 0 {
 			for _, r := range result {
@@ -58,6 +59,103 @@ func TestGenerateSparkline(t *testing.T) {
 					t.Errorf("generateSparkline(%v) contains invalid character: %c", test.input, r)
 				}
 			}
+		}
+	}
+}
+
+func TestSortChannels(t *testing.T) {
+	mk := func(topic string, depth, inflight int, inPerSec float64, processed int64) *ChannelData {
+		return &ChannelData{Topic: topic, Channel: "c", Depth: depth, InFlightCount: inflight, IncomingPerSecond: inPerSec, MessageCount: processed}
+	}
+	a := mk("a", 10, 5, 1.0, 100)
+	b := mk("b", 30, 1, 3.0, 300)
+	c := mk("c", 20, 9, 2.0, 200)
+
+	tests := []struct {
+		name   string
+		column int
+		desc   bool
+		want   []string // topics in expected order
+	}{
+		{"depth desc", sortColumnDepth, true, []string{"b", "c", "a"}},
+		{"depth asc", sortColumnDepth, false, []string{"a", "c", "b"}},
+		{"name asc", 0, false, []string{"a", "b", "c"}},
+		{"inflight desc", 2, true, []string{"c", "a", "b"}},
+		{"in/sec desc", 3, true, []string{"b", "c", "a"}},
+		{"processed asc", 5, false, []string{"a", "c", "b"}},
+	}
+
+	for _, test := range tests {
+		n := &NSQTop{sortColumn: test.column, sortDesc: test.desc}
+		channels := []*ChannelData{a, b, c}
+		n.sortChannels(channels)
+		for i, wantTopic := range test.want {
+			if channels[i].Topic != wantTopic {
+				t.Errorf("%s: position %d = %q; want %q", test.name, i, channels[i].Topic, wantTopic)
+			}
+		}
+	}
+}
+
+func TestChangeSortColumnWraps(t *testing.T) {
+	n := &NSQTop{sortColumn: 0, sortDesc: false}
+	n.changeSortColumn(-1)
+	if n.sortColumn != len(columnTitles)-1 {
+		t.Errorf("wrapping left from 0 should land on last column, got %d", n.sortColumn)
+	}
+	n.changeSortColumn(1)
+	if n.sortColumn != 0 {
+		t.Errorf("wrapping right from last should return to 0, got %d", n.sortColumn)
+	}
+	// Moving to a numeric column defaults to descending; the name column to ascending.
+	n.changeSortColumn(1) // -> column 1 (Depth, numeric)
+	if !n.sortDesc {
+		t.Errorf("numeric column should default to descending")
+	}
+}
+
+func TestAdjustInterval(t *testing.T) {
+	newTop := func(start time.Duration) *NSQTop {
+		n := &NSQTop{intervalCh: make(chan time.Duration, 1)}
+		n.intervalNanos.Store(int64(start))
+		return n
+	}
+
+	// One step faster / slower.
+	n := newTop(5 * time.Second)
+	n.adjustInterval(-IntervalStep)
+	if got := n.getInterval(); got != 5*time.Second-IntervalStep {
+		t.Errorf("faster: got %v; want %v", got, 5*time.Second-IntervalStep)
+	}
+
+	// Clamps at the minimum no matter how many times we speed up.
+	n = newTop(1 * time.Second)
+	for i := 0; i < 50; i++ {
+		n.adjustInterval(-IntervalStep)
+	}
+	if got := n.getInterval(); got != MinInterval {
+		t.Errorf("clamp min: got %v; want %v", got, MinInterval)
+	}
+
+	// Clamps at the maximum no matter how many times we slow down.
+	n = newTop(1 * time.Second)
+	for i := 0; i < 100; i++ {
+		n.adjustInterval(IntervalStep)
+	}
+	if got := n.getInterval(); got != MaxInterval {
+		t.Errorf("clamp max: got %v; want %v", got, MaxInterval)
+	}
+}
+
+func TestNormalizeAddresses(t *testing.T) {
+	got := normalizeAddresses(" localhost:4161 , http://h2:4161/ ,, https://h3:4161")
+	want := []string{"http://localhost:4161", "http://h2:4161", "https://h3:4161"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("address %d = %q; want %q", i, got[i], want[i])
 		}
 	}
 }

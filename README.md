@@ -59,9 +59,24 @@ docker run --rm -it ghcr.io/fleetchaser/nsqtop:latest --lookupd-http-address "yo
 # Monitor multiple nsqlookupd instances
 ./nsqtop --lookupd-http-address "localhost:4161,localhost:4162"
 
+# Connect directly to one or more nsqd instances, bypassing nsqlookupd
+./nsqtop --nsqd-http-address "localhost:4151,localhost:4251"
+
 # Custom refresh interval (default: 2 seconds)
 ./nsqtop --lookupd-http-address localhost:4161 --interval 5
 ```
+
+### Navigation
+
+| Key            | Action                                          |
+| -------------- | ----------------------------------------------- |
+| `←` / `→`      | Change the sort column                          |
+| `Enter`        | Reverse the sort direction                      |
+| `-` / `+`      | Faster / slower refresh (200ms–10s)             |
+| `↑` / `↓`      | Scroll the table                                |
+| `Ctrl+C`       | Quit                                            |
+
+The header row stays pinned while scrolling, and the active sort column is marked with a `▲`/`▼` arrow. The current refresh interval is shown in the status panel.
 
 ### Environment Variables
 
@@ -69,6 +84,8 @@ You can also configure nsqtop using environment variables:
 
 ```bash
 export NSQTOP_LOOKUPD_ADDRESSES="localhost:4161,localhost:4162"
+# or connect directly to nsqd instead:
+export NSQTOP_NSQD_ADDRESSES="localhost:4151"
 export NSQTOP_INTERVAL=3
 ./nsqtop
 ```
@@ -81,22 +98,28 @@ Usage:
 
 Flags:
   -h, --help                          help for nsqtop
-  -i, --interval int                  Refresh interval in seconds (default 2)
+  -i, --interval int                  Initial refresh interval in seconds (default 2; adjust at runtime with -/+)
   -l, --lookupd-http-address string   Comma-separated HTTP addresses of nsqlookupd instances
+  -n, --nsqd-http-address string      Comma-separated HTTP addresses of nsqd instances (bypasses nsqlookupd)
 ```
+
+Provide either `--lookupd-http-address` or `--nsqd-http-address`. When nsqd addresses are given, they are queried directly and nsqlookupd discovery is skipped.
 
 ## Interface
 
 The terminal interface displays:
 
 - **Header**: Current time and connection status
-- **Summary**: Total in-flight messages, channel count, and trend sparkline
+- **Summary**: Total depth, in-flight messages, channel count, and an in-flight trend sparkline, plus the cluster-wide total message count and global incoming rate (per second and per minute)
 - **Table**: Detailed statistics for each topic/channel combination
   - **Topic/Channel**: Name of the topic and channel
   - **Depth**: Number of queued messages (color-coded by severity)
   - **In-Flight**: Number of messages currently being processed
-  - **Rate/sec**: Messages processed per second
-  - **Rate/min**: Messages processed per minute
+  - **In/sec**: Incoming messages per second (rate of messages produced to the topic)
+  - **In/min**: Incoming messages per minute
+  - **Processed**: Cumulative number of messages the channel has handled
+
+The interface uses a dark color scheme.
 
 ### Color Coding
 
