@@ -116,6 +116,16 @@ type NSQTop struct {
 	filtering  bool
 	filterText string
 
+	// Count baseline, toggled with "c"/"C". When active, the cumulative columns
+	// (Processed, Timeouts, Requeues) and Total Msgs are shown as the delta since
+	// the baseline was captured, so changes are easy to read at a glance.
+	baselineActive bool
+	baselineAt     time.Time
+	baseProcessed  map[string]int64 // per topic/channel MessageCount at capture
+	baseTimeout    map[string]int64
+	baseRequeue    map[string]int64
+	baseTotalMsgs  int64
+
 	// Sorting state, driven by the arrow keys.
 	sortColumn int
 	sortDesc   bool
@@ -346,6 +356,12 @@ func (n *NSQTop) initUI() {
 			case '+', '=': // larger interval -> slower refresh
 				n.adjustInterval(IntervalStep)
 				return nil
+			case 'c': // zero the cumulative counters (re-zero on each press)
+				n.zeroCounts()
+				return nil
+			case 'C': // clear the baseline, back to absolute totals
+				n.clearBaseline()
+				return nil
 			}
 		}
 		return event
@@ -422,6 +438,72 @@ func (n *NSQTop) redraw() {
 	n.updateUI(n.lastChannels, n.lastTotals, n.lastNodes)
 }
 
+// zeroCounts captures the current cumulative counters as a baseline so the
+// Processed/Timeouts/Requeues columns and Total Msgs show the delta since this
+// moment. Pressing "c" again re-zeroes from the latest snapshot.
+func (n *NSQTop) zeroCounts() {
+	if n.lastChannels == nil {
+		return
+	}
+	n.baseProcessed = make(map[string]int64, len(n.lastChannels))
+	n.baseTimeout = make(map[string]int64, len(n.lastChannels))
+	n.baseRequeue = make(map[string]int64, len(n.lastChannels))
+	for _, c := range n.lastChannels {
+		key := c.Topic + "/" + c.Channel
+		n.baseProcessed[key] = c.MessageCount
+		n.baseTimeout[key] = c.TimeoutCount
+		n.baseRequeue[key] = c.RequeueCount
+	}
+	n.baseTotalMsgs = n.lastTotals.MessageCount
+	n.baselineActive = true
+	n.baselineAt = time.Now()
+	n.scrollTop = true
+	n.redraw()
+}
+
+// clearBaseline discards the baseline, returning the cumulative columns to
+// nsqd's absolute lifetime totals.
+func (n *NSQTop) clearBaseline() {
+	if !n.baselineActive {
+		return
+	}
+	n.baselineActive = false
+	n.scrollTop = true
+	n.redraw()
+}
+
+// dispProcessed/dispTimeout/dispRequeue return the value to show for a channel:
+// the raw cumulative count, or the delta since the baseline when one is active.
+func (n *NSQTop) dispProcessed(c *ChannelData) int64 {
+	if n.baselineActive {
+		return sub(c.MessageCount, n.baseProcessed[c.Topic+"/"+c.Channel])
+	}
+	return c.MessageCount
+}
+
+func (n *NSQTop) dispTimeout(c *ChannelData) int64 {
+	if n.baselineActive {
+		return sub(c.TimeoutCount, n.baseTimeout[c.Topic+"/"+c.Channel])
+	}
+	return c.TimeoutCount
+}
+
+func (n *NSQTop) dispRequeue(c *ChannelData) int64 {
+	if n.baselineActive {
+		return sub(c.RequeueCount, n.baseRequeue[c.Topic+"/"+c.Channel])
+	}
+	return c.RequeueCount
+}
+
+// sub returns cur-base, clamped at 0 so a counter reset (or a channel that
+// appeared after the baseline) never shows a negative delta.
+func sub(cur, base int64) int64 {
+	if d := cur - base; d > 0 {
+		return d
+	}
+	return 0
+}
+
 // sortChannels orders channels in place by the active sort column and
 // direction, with a stable secondary sort on topic/channel name so equal-valued
 // rows keep a consistent order across refreshes instead of jumping around.
@@ -440,11 +522,11 @@ func (n *NSQTop) sortChannels(channels []*ChannelData) {
 		case 4:
 			return cmpFloat(a.IncomingPerMinute, b.IncomingPerMinute)
 		case 5:
-			return cmpInt(a.MessageCount, b.MessageCount)
+			return cmpInt(n.dispProcessed(a), n.dispProcessed(b))
 		case 6:
-			return cmpInt(a.TimeoutCount, b.TimeoutCount)
+			return cmpInt(n.dispTimeout(a), n.dispTimeout(b))
 		case 7:
-			return cmpInt(a.RequeueCount, b.RequeueCount)
+			return cmpInt(n.dispRequeue(a), n.dispRequeue(b))
 		default: // Depth
 			return cmpInt(int64(a.Depth), int64(b.Depth))
 		}
@@ -755,18 +837,28 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 	if n.sortDesc {
 		sortDirArrow = "▼"
 	}
+
+	// When a baseline is active, Total Msgs and the cumulative columns read as a
+	// delta since it was captured; flag this on the totals line.
+	totalMsgs := totals.MessageCount
+	msgsLabel := "Total Msgs"
+	if n.baselineActive {
+		totalMsgs = sub(totals.MessageCount, n.baseTotalMsgs)
+		msgsLabel = fmt.Sprintf("Δ Msgs (since %s)", n.baselineAt.Format("15:04:05"))
+	}
 	summaryText := fmt.Sprintf(
 		"[#7aa2f7]NSQ Top - %s - Connected to %s[-]\n"+
 			"[#e0af68]Total Depth: %s | Total In-Flight: %s | Channels: %s[-]\n"+
-			"[#bb9af7]Total Msgs: %s | Rate: %s/s, %s/m[-]\n"+
+			"[#bb9af7]%s: %s | Rate: %s/s, %s/m[-]\n"+
 			"[#9ece6a]NSQd Servers: %s[-]\n"+
-			"[#565f89]Sort: %s %s  •  Refresh: %s  •  / filter  •  ←/→ sort  •  Enter reverse  •  − faster / + slower  •  Ctrl+C quit[-]",
+			"[#565f89]Sort: %s %s  •  Refresh: %s  •  / filter  •  ←/→ sort  •  Enter reverse  •  − faster / + slower  •  c zero / C clear  •  Ctrl+C quit[-]",
 		time.Now().Format("2006-01-02 15:04:05"),
 		lookupDisplay,
 		formatNumber(totalDepth),
 		formatNumber(totals.Inflight),
 		channelsField,
-		formatNumber64(totals.MessageCount),
+		msgsLabel,
+		formatNumber64(totalMsgs),
 		formatRate(totals.IncomingPerSec, 1),
 		formatRate(totals.IncomingPerSec*60, 0),
 		nsqdDisplay,
@@ -802,6 +894,10 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 	// left-aligned; numeric columns are right-aligned to sit over their values.
 	// An arrow marks the active sort column.
 	for i, header := range columnTitles {
+		// Mark the cumulative columns as deltas while a baseline is active.
+		if n.baselineActive && i >= 5 {
+			header = "Δ " + header
+		}
 		if i == n.sortColumn {
 			header = header + " " + sortDirArrow
 		}
@@ -845,17 +941,18 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 		// Incoming per minute
 		n.table.SetCell(row, 4, tview.NewTableCell(formatRate(channel.IncomingPerMinute, 0)).SetAlign(tview.AlignRight))
 
-		// Processed (cumulative messages handled by the channel)
-		n.table.SetCell(row, 5, tview.NewTableCell(formatNumber64(channel.MessageCount)).SetAlign(tview.AlignRight))
+		// Processed (cumulative messages handled by the channel, or the delta
+		// since the baseline when one is active).
+		n.table.SetCell(row, 5, tview.NewTableCell(formatNumber64(n.dispProcessed(channel))).SetAlign(tview.AlignRight))
 
 		// Timeouts and Requeues, with a ▲rate growth marker when climbing.
-		timeoutCell := tview.NewTableCell(formatGrowth(channel.TimeoutCount, channel.TimeoutRate)).SetAlign(tview.AlignRight)
+		timeoutCell := tview.NewTableCell(formatGrowth(n.dispTimeout(channel), channel.TimeoutRate)).SetAlign(tview.AlignRight)
 		if channel.TimeoutRate >= 0.05 {
 			timeoutCell.SetTextColor(colorCrit)
 		}
 		n.table.SetCell(row, 6, timeoutCell)
 
-		requeueCell := tview.NewTableCell(formatGrowth(channel.RequeueCount, channel.RequeueRate)).SetAlign(tview.AlignRight)
+		requeueCell := tview.NewTableCell(formatGrowth(n.dispRequeue(channel), channel.RequeueRate)).SetAlign(tview.AlignRight)
 		if channel.RequeueRate >= 0.05 {
 			requeueCell.SetTextColor(colorWarn)
 		}

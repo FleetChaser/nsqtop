@@ -73,10 +73,14 @@ docker run --rm -it ghcr.io/fleetchaser/nsqtop:latest --lookupd-http-address "yo
 | `←` / `→`      | Change the sort column                          |
 | `Enter`        | Reverse the sort direction                      |
 | `-` / `+`      | Faster / slower refresh (200ms–10s)             |
+| `c`            | Zero the counters (track deltas from now)       |
+| `C`            | Clear the baseline (back to absolute totals)    |
 | `↑` / `↓`      | Scroll the table                                |
 | `Ctrl+C`       | Quit                                            |
 
 The header row stays pinned while scrolling, and the active sort column is marked with a `▲`/`▼` arrow. The current refresh interval is shown in the status panel.
+
+Press `c` to snapshot the current Processed, Timeouts, Requeues, and Total Msgs as a baseline; those columns then show the change since that moment (marked with `Δ`), making it easy to watch differences without doing the subtraction yourself. Press `c` again to re-zero from the latest values, or `C` to return to nsqd's absolute lifetime totals.
 
 ### Environment Variables
 
