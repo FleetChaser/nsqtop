@@ -64,6 +64,9 @@ docker run --rm -it ghcr.io/fleetchaser/nsqtop:latest --lookupd-http-address "yo
 
 # Custom refresh interval (default: 2 seconds)
 ./nsqtop --lookupd-http-address localhost:4161 --interval 5
+
+# Label the cluster so you can tell instances apart at a glance
+./nsqtop --lookupd-http-address localhost:4161 --name production
 ```
 
 ### Navigation
@@ -91,6 +94,8 @@ export NSQTOP_LOOKUPD_ADDRESSES="localhost:4161,localhost:4162"
 # or connect directly to nsqd instead:
 export NSQTOP_NSQD_ADDRESSES="localhost:4151"
 export NSQTOP_INTERVAL=3
+# label the cluster so you can tell instances apart:
+export NSQTOP_CLUSTER_NAME="production"
 ./nsqtop
 ```
 
@@ -104,6 +109,7 @@ Flags:
   -h, --help                          help for nsqtop
   -i, --interval int                  Initial refresh interval in seconds (default 2; adjust at runtime with -/+)
   -l, --lookupd-http-address string   Comma-separated HTTP addresses of nsqlookupd instances
+      --name string                   Label for this cluster, shown in the status panel (helps tell instances apart)
   -n, --nsqd-http-address string      Comma-separated HTTP addresses of nsqd instances (bypasses nsqlookupd)
 ```
 

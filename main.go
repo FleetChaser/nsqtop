@@ -97,6 +97,7 @@ type NSQTop struct {
 	filterInput        *tview.InputField
 	flex               *tview.Flex
 	client             *http.Client
+	clusterName        string // optional label shown in the status panel
 	lookupURLs         []string
 	nsqdURLs           []string
 	intervalNanos      atomic.Int64       // current refresh interval; adjustable at runtime
@@ -147,6 +148,7 @@ var (
 	lookupAddresses string
 	nsqdAddresses   string
 	refreshInterval int
+	clusterName     string
 )
 
 func main() {
@@ -172,6 +174,7 @@ func main() {
 	defaultNSQD := getEnvWithFallback("NSQTOP_NSQD_ADDRESSES",
 		getEnvWithFallback("NSQTOP_NSQD_ADDRESS", ""))
 	defaultInterval := getEnvIntWithFallback("NSQTOP_INTERVAL", DefaultInterval)
+	defaultName := getEnvWithFallback("NSQTOP_CLUSTER_NAME", "")
 
 	rootCmd.Flags().StringVarP(&lookupAddresses, "lookupd-http-address", "l", defaultLookupd,
 		"Comma-separated HTTP addresses of nsqlookupd instances (e.g., localhost:4161)")
@@ -179,6 +182,8 @@ func main() {
 		"Comma-separated HTTP addresses of nsqd instances; queried directly, bypassing nsqlookupd (e.g., localhost:4151)")
 	rootCmd.Flags().IntVarP(&refreshInterval, "interval", "i", defaultInterval,
 		"Refresh interval in seconds")
+	rootCmd.Flags().StringVar(&clusterName, "name", defaultName,
+		"Label for this cluster, shown in the status panel (helps tell instances apart)")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
@@ -202,6 +207,7 @@ func runNSQTop(cmd *cobra.Command, args []string) {
 	}
 
 	nsqTop := &NSQTop{
+		clusterName:        strings.TrimSpace(clusterName),
 		lookupURLs:         lookupURLs,
 		nsqdURLs:           nsqdURLs,
 		intervalCh:         make(chan time.Duration, 1),
@@ -266,7 +272,11 @@ func (n *NSQTop) initUI() {
 	n.summary = tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(false)
-	n.summary.SetBorder(true).SetTitle("NSQ Cluster Status")
+	summaryTitle := "NSQ Cluster Status"
+	if n.clusterName != "" {
+		summaryTitle = "NSQ Cluster Status — " + n.clusterName
+	}
+	n.summary.SetBorder(true).SetTitle(summaryTitle)
 
 	// Full-width in-flight trend strip, shown right above the table.
 	n.trend = tview.NewTextView().
@@ -846,12 +856,19 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 		totalMsgs = sub(totals.MessageCount, n.baseTotalMsgs)
 		msgsLabel = fmt.Sprintf("Δ Msgs (since %s)", n.baselineAt.Format("15:04:05"))
 	}
+	// Lead with the cluster label when one is set, so you can tell instances
+	// apart at a glance when running several side by side.
+	clusterPrefix := ""
+	if n.clusterName != "" {
+		clusterPrefix = fmt.Sprintf("[%s] ", n.clusterName)
+	}
 	summaryText := fmt.Sprintf(
-		"[#7aa2f7]NSQ Top - %s - Connected to %s[-]\n"+
+		"[#7aa2f7]%sNSQ Top - %s - Connected to %s[-]\n"+
 			"[#e0af68]Total Depth: %s | Total In-Flight: %s | Channels: %s[-]\n"+
 			"[#bb9af7]%s: %s | Rate: %s/s, %s/m[-]\n"+
 			"[#9ece6a]NSQd Servers: %s[-]\n"+
 			"[#565f89]Sort: %s %s  •  Refresh: %s  •  / filter  •  ←/→ sort  •  Enter reverse  •  − faster / + slower  •  c zero / C clear  •  Ctrl+C quit[-]",
+		clusterPrefix,
 		time.Now().Format("2006-01-02 15:04:05"),
 		lookupDisplay,
 		formatNumber(totalDepth),
