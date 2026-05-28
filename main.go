@@ -47,13 +47,30 @@ type NodesResponse struct {
 }
 
 type Channel struct {
-	ChannelName   string `json:"channel_name"`
-	Depth         int    `json:"depth"`
-	BackendDepth  int    `json:"backend_depth"`
-	InFlightCount int    `json:"in_flight_count"`
+	ChannelName   string        `json:"channel_name"`
+	Depth         int           `json:"depth"`
+	BackendDepth  int           `json:"backend_depth"`
+	InFlightCount int           `json:"in_flight_count"`
+	MessageCount  int64         `json:"message_count"`
+	TimeoutCount  int64         `json:"timeout_count"`
+	RequeueCount  int64         `json:"requeue_count"`
+	Clients       []ClientStats `json:"clients"`
+}
+
+// ClientStats is the per-client stats nsqd returns for each channel. We decode
+// the fields the detail view shows; everything else (tls, version, etc.) is
+// dropped on the floor.
+type ClientStats struct {
+	ClientID      string `json:"client_id"`
+	Hostname      string `json:"hostname"`
+	RemoteAddress string `json:"remote_address"`
+	State         int    `json:"state"`
+	ReadyCount    int64  `json:"ready_count"`
+	InFlightCount int64  `json:"in_flight_count"`
 	MessageCount  int64  `json:"message_count"`
-	TimeoutCount  int64  `json:"timeout_count"`
+	FinishCount   int64  `json:"finish_count"`
 	RequeueCount  int64  `json:"requeue_count"`
+	ConnectTs     int64  `json:"connect_ts"`
 }
 
 type Topic struct {
@@ -80,6 +97,8 @@ type ChannelData struct {
 	Channel           string
 	Depth             int
 	InFlightCount     int
+	ClientCount       int     // active consumer connections (sum across nsqd nodes)
+	ReadyCount        int64   // sum of RDY across the channel's clients
 	MessageCount      int64   // cumulative messages processed by the channel
 	IncomingPerSecond float64 // rate of messages produced to the topic
 	IncomingPerMinute float64
@@ -87,6 +106,20 @@ type ChannelData struct {
 	RequeueCount      int64
 	TimeoutRate       float64 // smoothed growth per second
 	RequeueRate       float64
+}
+
+// TopicData is a per-topic rollup of its channels, used by the topic view to
+// surface which topics are backing up.
+type TopicData struct {
+	Topic             string
+	ChannelCount      int
+	ConnectionCount   int // sum of client connections across the topic's channels
+	ReadyCount        int64
+	Depth             int // sum of channel depths
+	InFlightCount     int
+	IncomingPerSecond float64
+	IncomingPerMinute float64
+	MessageCount      int64 // produced-message counter for the topic
 }
 
 type NSQTop struct {
@@ -127,21 +160,67 @@ type NSQTop struct {
 	baseRequeue    map[string]int64
 	baseTotalMsgs  int64
 
-	// Sorting state, driven by the arrow keys.
+	// Sorting state, driven by the arrow keys. sortColumn/sortDesc track the
+	// active view; savedSorts preserves the inactive views' selections so
+	// switching between them restores each one's last sort.
 	sortColumn int
 	sortDesc   bool
+	savedSorts [viewCount]struct {
+		col  int
+		desc bool
+	}
+
+	// viewMode picks the table being rendered: viewChannels, viewTopics,
+	// viewChannelDetail, or viewTopicDetail.
+	viewMode int
+
+	// Topic baseline: the "c" baseline also captures per-topic message counts so
+	// the topic view's Messages column can show the delta since the baseline.
+	baseTopicMsgs map[string]int64
 
 	// Last rendered snapshot, so a key press can re-sort without waiting for
-	// the next refresh tick.
+	// the next refresh tick. lastRaw keeps the per-node responses so detail
+	// views can derive their rows without another HTTP round-trip.
 	lastChannels []*ChannelData
+	lastTopics   []*TopicData
 	lastTotals   Totals
 	lastNodes    []string
+	lastRaw      []nodeStats
+
+	// drillTarget identifies which topic (in viewTopicDetail) or topic/channel
+	// (in viewChannelDetail) the detail view is drilled into.
+	drillTarget string
 }
 
-// columnTitles is the table's column order; the sort column index refers to it.
-var columnTitles = []string{"Topic/Channel", "Depth", "In-Flight", "In/sec", "In/min", "Processed", "Timeouts", "Requeues"}
+// columnTitles is the channel view's column order; sortColumn indexes into it.
+var columnTitles = []string{"Topic/Channel", "Depth", "In-Flight", "Ready", "In/sec", "In/min", "Processed", "Timeouts", "Requeues"}
 
-const sortColumnDepth = 1
+// topicColumnTitles is the topic view's column order; it has its own sort state.
+var topicColumnTitles = []string{"Topic", "Channels", "Conns", "Depth", "In-Flight", "Ready", "In/sec", "In/min", "Messages"}
+
+const (
+	sortColumnDepth      = 1 // Depth in the channel view
+	sortColumnTopicDepth = 3 // Depth in the topic view
+)
+
+const (
+	viewChannels      = 0
+	viewTopics        = 1
+	viewChannelDetail = 2
+	viewTopicDetail   = 3
+	viewCount         = 4
+)
+
+// Sort column defaults for the detail views (indexes into their column lists).
+const (
+	sortColumnTopicDetailDepth   = 2 // Depth in the topic detail view
+	sortColumnChannelDetailFlight = 5 // In-Flight in the channel detail view
+)
+
+// channelDetailColumns and topicDetailColumns are the column orders for the
+// per-client and per-node drill-down views.
+var channelDetailColumns = []string{"Client", "Hostname", "Remote", "State", "Ready", "In-Flight", "Processed", "Requeued", "Connected"}
+var topicDetailColumns = []string{"NSQd Server", "Channels", "Depth", "In-Flight", "Conns", "Ready", "Messages"}
 
 // CLI configuration
 var (
@@ -221,8 +300,28 @@ func runNSQTop(cmd *cobra.Command, args []string) {
 		scrollTop:          true,
 		sortColumn:         sortColumnDepth,
 		sortDesc:           true,
+		viewMode:           viewChannels,
 		client:             &http.Client{Timeout: 5 * time.Second},
 	}
+	// Per-view sort defaults; the active view (channels) reads its sort from
+	// sortColumn/sortDesc above. The rest live in savedSorts until their view
+	// becomes active.
+	nsqTop.savedSorts[viewChannels] = struct {
+		col  int
+		desc bool
+	}{sortColumnDepth, true}
+	nsqTop.savedSorts[viewTopics] = struct {
+		col  int
+		desc bool
+	}{sortColumnTopicDepth, true}
+	nsqTop.savedSorts[viewTopicDetail] = struct {
+		col  int
+		desc bool
+	}{sortColumnTopicDetailDepth, true}
+	nsqTop.savedSorts[viewChannelDetail] = struct {
+		col  int
+		desc bool
+	}{sortColumnChannelDetailFlight, true}
 	nsqTop.intervalNanos.Store(int64(interval))
 
 	nsqTop.initUI()
@@ -244,6 +343,9 @@ var (
 	colorOK       = tcell.NewHexColor(0x9ece6a)
 	colorWarn     = tcell.NewHexColor(0xe0af68)
 	colorCrit     = tcell.NewHexColor(0xf7768e)
+	// colorColumnTint is a barely-there stripe behind the active sort column,
+	// just enough to lift it above the bg without competing with row selection.
+	colorColumnTint = tcell.NewHexColor(0x1f2235)
 )
 
 // applyDarkTheme switches tview's global theme to a dark palette. It must run
@@ -288,9 +390,11 @@ func (n *NSQTop) initUI() {
 	// the header is distinguished by an underline instead (see updateUI). It
 	// sits in its own bordered box with inner padding so the text isn't flush
 	// against the edge, matching the panels above.
+	// Rows are selectable so Enter can drill into the highlighted row;
+	// columns are not, because sorting is driven by ←/→ instead.
 	n.table = tview.NewTable().
 		SetBorders(false).
-		SetSelectable(false, false)
+		SetSelectable(true, false)
 	n.table.SetBorder(true).SetTitle("Channels").SetBorderPadding(0, 0, 1, 1)
 
 	// Filter bar, hidden (height 0) until "/" is pressed. Live-filters as you
@@ -337,7 +441,11 @@ func (n *NSQTop) initUI() {
 			n.app.Stop()
 			return nil
 		case tcell.KeyEscape:
-			// Clear an active filter from the table view.
+			// First Esc exits a detail view back to its parent; otherwise
+			// clear any active filter from the main view.
+			if n.drillOut() {
+				return nil
+			}
 			if n.filterText != "" {
 				n.filterText = ""
 				n.scrollTop = true
@@ -351,12 +459,18 @@ func (n *NSQTop) initUI() {
 			n.changeSortColumn(1)
 			return nil
 		case tcell.KeyEnter:
-			n.sortDesc = !n.sortDesc
-			n.scrollTop = true
-			n.redraw()
+			n.drillIn()
+			return nil
+		case tcell.KeyTab, tcell.KeyBacktab:
+			n.toggleView()
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
+			case ' ': // reverse the active sort direction
+				n.sortDesc = !n.sortDesc
+				n.scrollTop = true
+				n.redraw()
+				return nil
 			case '/': // open the topic/channel filter
 				n.startFilter()
 				return nil
@@ -395,15 +509,125 @@ func (n *NSQTop) stopFilter() {
 	n.redraw()
 }
 
+// drillIn handles Enter on the selected row. From the topic view, it opens a
+// per-nsqd-node breakdown of that topic; from the channel view, it opens a
+// per-client breakdown of that channel. Esc backs out.
+func (n *NSQTop) drillIn() {
+	if n.viewMode != viewTopics && n.viewMode != viewChannels {
+		return
+	}
+	row, _ := n.table.GetSelection()
+	if row < 1 {
+		return
+	}
+	cell := n.table.GetCell(row, 0)
+	if cell == nil {
+		return
+	}
+	target, ok := cell.GetReference().(string)
+	if !ok || target == "" {
+		return
+	}
+	n.drillTarget = target
+	if n.viewMode == viewTopics {
+		n.switchView(viewTopicDetail)
+	} else {
+		n.switchView(viewChannelDetail)
+	}
+	n.redraw()
+}
+
+// drillOut returns from a detail view to its parent main view, clearing the
+// drill target. Returns true if a detail view was actually closed; false lets
+// Esc fall through to its normal "clear filter" behavior.
+func (n *NSQTop) drillOut() bool {
+	switch n.viewMode {
+	case viewTopicDetail:
+		n.drillTarget = ""
+		n.switchView(viewTopics)
+		n.redraw()
+		return true
+	case viewChannelDetail:
+		n.drillTarget = ""
+		n.switchView(viewChannels)
+		n.redraw()
+		return true
+	}
+	return false
+}
+
 // changeSortColumn moves the active sort column by delta (wrapping around) and
 // resets to a sensible default direction: ascending for the name column,
 // descending for the numeric ones.
 func (n *NSQTop) changeSortColumn(delta int) {
-	cols := len(columnTitles)
+	cols := len(n.activeColumns())
 	n.sortColumn = (n.sortColumn + delta + cols) % cols
 	n.sortDesc = n.sortColumn != 0
 	n.scrollTop = true
 	n.redraw()
+}
+
+// activeColumns returns the column titles for the active view.
+func (n *NSQTop) activeColumns() []string {
+	switch n.viewMode {
+	case viewTopics:
+		return topicColumnTitles
+	case viewTopicDetail:
+		return topicDetailColumns
+	case viewChannelDetail:
+		return channelDetailColumns
+	default:
+		return columnTitles
+	}
+}
+
+// switchView changes the active view, saving the outgoing view's sort and
+// restoring the incoming view's, so per-view sort selections are preserved.
+func (n *NSQTop) switchView(next int) {
+	if next == n.viewMode {
+		return
+	}
+	n.savedSorts[n.viewMode] = struct {
+		col  int
+		desc bool
+	}{n.sortColumn, n.sortDesc}
+	n.viewMode = next
+	n.sortColumn = n.savedSorts[next].col
+	n.sortDesc = n.savedSorts[next].desc
+	n.table.SetTitle(n.tableTitle())
+	n.scrollTop = true
+}
+
+// toggleView cycles between the main channels and topics tables. From a detail
+// view it goes back to the parent main view first; the next Tab toggles between
+// the two main views as usual.
+func (n *NSQTop) toggleView() {
+	switch n.viewMode {
+	case viewChannels:
+		n.switchView(viewTopics)
+	case viewTopics:
+		n.switchView(viewChannels)
+	case viewChannelDetail:
+		n.switchView(viewChannels)
+	case viewTopicDetail:
+		n.switchView(viewTopics)
+	}
+	n.redraw()
+}
+
+// tableTitle returns the title to show on the table panel for the active view,
+// including the drill target for detail views.
+func (n *NSQTop) tableTitle() string {
+	switch n.viewMode {
+	case viewTopics:
+		return "Topics"
+	case viewTopicDetail:
+		return fmt.Sprintf("Topic Detail — %s (Esc to back out)", n.drillTarget)
+	case viewChannelDetail:
+		return fmt.Sprintf("Channel Detail — %s (Esc to back out)", n.drillTarget)
+	default:
+		return "Channels"
+	}
 }
 
 // getInterval returns the current refresh interval (safe across goroutines).
@@ -445,7 +669,7 @@ func (n *NSQTop) redraw() {
 	if n.lastChannels == nil {
 		return
 	}
-	n.updateUI(n.lastChannels, n.lastTotals, n.lastNodes)
+	n.updateUI(n.lastChannels, n.lastTopics, n.lastTotals, n.lastNodes)
 }
 
 // zeroCounts captures the current cumulative counters as a baseline so the
@@ -463,6 +687,10 @@ func (n *NSQTop) zeroCounts() {
 		n.baseProcessed[key] = c.MessageCount
 		n.baseTimeout[key] = c.TimeoutCount
 		n.baseRequeue[key] = c.RequeueCount
+	}
+	n.baseTopicMsgs = make(map[string]int64, len(n.lastTopics))
+	for _, t := range n.lastTopics {
+		n.baseTopicMsgs[t.Topic] = t.MessageCount
 	}
 	n.baseTotalMsgs = n.lastTotals.MessageCount
 	n.baselineActive = true
@@ -505,6 +733,13 @@ func (n *NSQTop) dispRequeue(c *ChannelData) int64 {
 	return c.RequeueCount
 }
 
+func (n *NSQTop) dispTopicMsgs(t *TopicData) int64 {
+	if n.baselineActive {
+		return sub(t.MessageCount, n.baseTopicMsgs[t.Topic])
+	}
+	return t.MessageCount
+}
+
 // sub returns cur-base, clamped at 0 so a counter reset (or a channel that
 // appeared after the baseline) never shows a negative delta.
 func sub(cur, base int64) int64 {
@@ -528,16 +763,18 @@ func (n *NSQTop) sortChannels(channels []*ChannelData) {
 		case 2:
 			return cmpInt(int64(a.InFlightCount), int64(b.InFlightCount))
 		case 3:
-			return cmpFloat(a.IncomingPerSecond, b.IncomingPerSecond)
+			return cmpInt(a.ReadyCount, b.ReadyCount)
 		case 4:
-			return cmpFloat(a.IncomingPerMinute, b.IncomingPerMinute)
+			return cmpFloat(a.IncomingPerSecond, b.IncomingPerSecond)
 		case 5:
-			return cmpInt(n.dispProcessed(a), n.dispProcessed(b))
+			return cmpFloat(a.IncomingPerMinute, b.IncomingPerMinute)
 		case 6:
-			return cmpInt(n.dispTimeout(a), n.dispTimeout(b))
+			return cmpInt(n.dispProcessed(a), n.dispProcessed(b))
 		case 7:
+			return cmpInt(n.dispTimeout(a), n.dispTimeout(b))
+		case 8:
 			return cmpInt(n.dispRequeue(a), n.dispRequeue(b))
-		default: // Depth
+		default: // 1: Depth
 			return cmpInt(int64(a.Depth), int64(b.Depth))
 		}
 	}
@@ -553,6 +790,286 @@ func (n *NSQTop) sortChannels(channels []*ChannelData) {
 		// Tiebreak by name, always ascending, for a stable order.
 		return name(a) < name(b)
 	})
+}
+
+// sortTopics orders topics in place by the topic view's active sort column,
+// using the topic name as a stable secondary key.
+func (n *NSQTop) sortTopics(topics []*TopicData) {
+	primaryCmp := func(a, b *TopicData) int {
+		switch n.sortColumn {
+		case 0:
+			return strings.Compare(a.Topic, b.Topic)
+		case 1:
+			return cmpInt(int64(a.ChannelCount), int64(b.ChannelCount))
+		case 2:
+			return cmpInt(int64(a.ConnectionCount), int64(b.ConnectionCount))
+		case 4:
+			return cmpInt(int64(a.InFlightCount), int64(b.InFlightCount))
+		case 5:
+			return cmpInt(a.ReadyCount, b.ReadyCount)
+		case 6:
+			return cmpFloat(a.IncomingPerSecond, b.IncomingPerSecond)
+		case 7:
+			return cmpFloat(a.IncomingPerMinute, b.IncomingPerMinute)
+		case 8:
+			return cmpInt(n.dispTopicMsgs(a), n.dispTopicMsgs(b))
+		default: // 3: Depth
+			return cmpInt(int64(a.Depth), int64(b.Depth))
+		}
+	}
+
+	sort.Slice(topics, func(i, j int) bool {
+		a, b := topics[i], topics[j]
+		if c := primaryCmp(a, b); c != 0 {
+			if n.sortDesc {
+				return c > 0
+			}
+			return c < 0
+		}
+		return a.Topic < b.Topic
+	})
+}
+
+// filterTopics returns topics whose name contains query (case-insensitive).
+func filterTopics(topics []*TopicData, query string) []*TopicData {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return topics
+	}
+	var out []*TopicData
+	for _, t := range topics {
+		if strings.Contains(strings.ToLower(t.Topic), query) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// TopicNodeRow is one nsqd node's contribution to a topic, shown in the topic
+// detail view so you can see where the messages actually live.
+type TopicNodeRow struct {
+	NodeURL       string
+	Display       string // node label (host:port)
+	ChannelCount  int
+	Depth         int
+	InFlightCount int
+	ClientCount   int
+	ReadyCount    int64
+	MessageCount  int64 // topic's produced-message counter on this node
+}
+
+// ClientRow is one consumer connection on a specific channel, shown in the
+// channel detail view.
+type ClientRow struct {
+	NodeURL       string
+	ClientID      string
+	Hostname      string
+	RemoteAddress string
+	State         int
+	ReadyCount    int64
+	InFlightCount int64
+	MessageCount  int64
+	FinishCount   int64
+	RequeueCount  int64
+	ConnectTs     int64
+}
+
+// aggregateTopicDetail builds one row per nsqd node that hosts the named topic,
+// summing the topic's channels' stats on that node.
+func aggregateTopicDetail(raw []nodeStats, topicName string) []*TopicNodeRow {
+	var rows []*TopicNodeRow
+	for _, node := range raw {
+		for _, topic := range node.Stats.Topics {
+			if topic.TopicName != topicName {
+				continue
+			}
+			row := &TopicNodeRow{
+				NodeURL:      node.URL,
+				Display:      displayNodeURL(node.URL),
+				ChannelCount: len(topic.Channels),
+				MessageCount: topic.MessageCount,
+			}
+			for _, ch := range topic.Channels {
+				row.Depth += ch.Depth + ch.BackendDepth
+				row.InFlightCount += ch.InFlightCount
+				row.ClientCount += len(ch.Clients)
+				for _, c := range ch.Clients {
+					row.ReadyCount += c.ReadyCount
+				}
+			}
+			rows = append(rows, row)
+			break // a topic only appears once per node
+		}
+	}
+	return rows
+}
+
+// aggregateChannelDetail builds one row per connected consumer on the named
+// topic/channel across all nsqd nodes.
+func aggregateChannelDetail(raw []nodeStats, target string) []*ClientRow {
+	topicName, channelName, ok := splitTopicChannel(target)
+	if !ok {
+		return nil
+	}
+	var rows []*ClientRow
+	for _, node := range raw {
+		for _, topic := range node.Stats.Topics {
+			if topic.TopicName != topicName {
+				continue
+			}
+			for _, ch := range topic.Channels {
+				if ch.ChannelName != channelName {
+					continue
+				}
+				for _, c := range ch.Clients {
+					rows = append(rows, &ClientRow{
+						NodeURL:       node.URL,
+						ClientID:      c.ClientID,
+						Hostname:      c.Hostname,
+						RemoteAddress: c.RemoteAddress,
+						State:         c.State,
+						ReadyCount:    c.ReadyCount,
+						InFlightCount: c.InFlightCount,
+						MessageCount:  c.MessageCount,
+						FinishCount:   c.FinishCount,
+						RequeueCount:  c.RequeueCount,
+						ConnectTs:     c.ConnectTs,
+					})
+				}
+			}
+		}
+	}
+	return rows
+}
+
+// splitTopicChannel splits "topic/channel" into its parts. Topic and channel
+// names can't contain "/", so a simple split is unambiguous.
+func splitTopicChannel(key string) (topic, channel string, ok bool) {
+	i := strings.IndexByte(key, '/')
+	if i < 0 {
+		return "", "", false
+	}
+	return key[:i], key[i+1:], true
+}
+
+// displayNodeURL strips the scheme from an nsqd URL for compact display.
+func displayNodeURL(u string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")
+}
+
+// sortTopicDetail orders per-node rows by the active sort column.
+func (n *NSQTop) sortTopicDetail(rows []*TopicNodeRow) {
+	primaryCmp := func(a, b *TopicNodeRow) int {
+		switch n.sortColumn {
+		case 0:
+			return strings.Compare(a.Display, b.Display)
+		case 1:
+			return cmpInt(int64(a.ChannelCount), int64(b.ChannelCount))
+		case 3:
+			return cmpInt(int64(a.InFlightCount), int64(b.InFlightCount))
+		case 4:
+			return cmpInt(int64(a.ClientCount), int64(b.ClientCount))
+		case 5:
+			return cmpInt(a.ReadyCount, b.ReadyCount)
+		case 6:
+			return cmpInt(a.MessageCount, b.MessageCount)
+		default: // 2: Depth
+			return cmpInt(int64(a.Depth), int64(b.Depth))
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if c := primaryCmp(a, b); c != 0 {
+			if n.sortDesc {
+				return c > 0
+			}
+			return c < 0
+		}
+		return a.Display < b.Display
+	})
+}
+
+// sortClientDetail orders per-client rows by the active sort column.
+func (n *NSQTop) sortClientDetail(rows []*ClientRow) {
+	label := func(c *ClientRow) string {
+		if c.ClientID != "" {
+			return c.ClientID
+		}
+		return c.RemoteAddress
+	}
+	primaryCmp := func(a, b *ClientRow) int {
+		switch n.sortColumn {
+		case 0:
+			return strings.Compare(label(a), label(b))
+		case 1:
+			return strings.Compare(a.Hostname, b.Hostname)
+		case 2:
+			return strings.Compare(a.RemoteAddress, b.RemoteAddress)
+		case 3:
+			return cmpInt(int64(a.State), int64(b.State))
+		case 4:
+			return cmpInt(a.ReadyCount, b.ReadyCount)
+		case 6:
+			return cmpInt(a.MessageCount, b.MessageCount)
+		case 7:
+			return cmpInt(a.RequeueCount, b.RequeueCount)
+		case 8:
+			return cmpInt(a.ConnectTs, b.ConnectTs)
+		default: // 5: In-Flight
+			return cmpInt(a.InFlightCount, b.InFlightCount)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if c := primaryCmp(a, b); c != 0 {
+			if n.sortDesc {
+				return c > 0
+			}
+			return c < 0
+		}
+		return label(a) < label(b)
+	})
+}
+
+// clientStateLabel renders nsqd's client State int as a short word. The values
+// are from nsqd's protocol: init/disconnected/connected/subscribed/closing.
+func clientStateLabel(s int) string {
+	switch s {
+	case 0:
+		return "Init"
+	case 1:
+		return "Disconn"
+	case 2:
+		return "Conn"
+	case 3:
+		return "Sub"
+	case 4:
+		return "Closing"
+	default:
+		return strconv.Itoa(s)
+	}
+}
+
+// formatConnectedFor renders an nsqd connect_ts (seconds since epoch) as a
+// short "how long has this client been connected" duration like "3m12s".
+func formatConnectedFor(connectTs int64) string {
+	if connectTs <= 0 {
+		return "—"
+	}
+	d := time.Since(time.Unix(connectTs, 0))
+	if d < 0 {
+		return "—"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd%02dh", int(d.Hours())/24, int(d.Hours())%24)
 }
 
 func cmpInt(a, b int64) int {
@@ -619,7 +1136,7 @@ func (n *NSQTop) updateData() {
 		return
 	}
 
-	channels, totals := n.processStats(allStats)
+	channels, topics, totals := n.processStats(allStats)
 
 	// Trend sample = messages processed during this interval + current in-flight,
 	// so the graph reflects actual traffic rather than just the in-flight gauge
@@ -639,7 +1156,8 @@ func (n *NSQTop) updateData() {
 	}
 
 	n.app.QueueUpdateDraw(func() {
-		n.updateUI(channels, totals, nodeURLs)
+		n.lastRaw = allStats
+		n.updateUI(channels, topics, totals, nodeURLs)
 	})
 }
 
@@ -681,8 +1199,15 @@ func (n *NSQTop) getNSQDNodes() ([]string, error) {
 	return nodeURLs, nil
 }
 
-func (n *NSQTop) getAllStats(nodeURLs []string) ([]StatsResponse, error) {
-	var allStats []StatsResponse
+// nodeStats pairs a successful nsqd /stats response with the URL it came from
+// so detail views can attribute rows back to a specific node.
+type nodeStats struct {
+	URL   string
+	Stats StatsResponse
+}
+
+func (n *NSQTop) getAllStats(nodeURLs []string) ([]nodeStats, error) {
+	var allStats []nodeStats
 
 	for _, base := range nodeURLs {
 		resp, err := n.client.Get(base + "/stats?format=json")
@@ -699,22 +1224,22 @@ func (n *NSQTop) getAllStats(nodeURLs []string) ([]StatsResponse, error) {
 
 		// Handle newer NSQ versions where data is nested
 		if stats.Data != nil {
-			allStats = append(allStats, *stats.Data)
+			allStats = append(allStats, nodeStats{URL: base, Stats: *stats.Data})
 		} else {
-			allStats = append(allStats, stats)
+			allStats = append(allStats, nodeStats{URL: base, Stats: stats})
 		}
 	}
 
 	return allStats, nil
 }
 
-func (n *NSQTop) processStats(allStats []StatsResponse) ([]*ChannelData, Totals) {
+func (n *NSQTop) processStats(allStats []nodeStats) ([]*ChannelData, []*TopicData, Totals) {
 	channelData := make(map[string]*ChannelData)
 	topicMessages := make(map[string]int64)
 	totalInflight := 0
 
-	for _, stats := range allStats {
-		for _, topic := range stats.Topics {
+	for _, node := range allStats {
+		for _, topic := range node.Stats.Topics {
 			topicMessages[topic.TopicName] += topic.MessageCount
 
 			for _, channel := range topic.Channels {
@@ -730,6 +1255,10 @@ func (n *NSQTop) processStats(allStats []StatsResponse) ([]*ChannelData, Totals)
 				data := channelData[key]
 				data.Depth += channel.Depth + channel.BackendDepth
 				data.InFlightCount += channel.InFlightCount
+				data.ClientCount += len(channel.Clients)
+				for _, c := range channel.Clients {
+					data.ReadyCount += c.ReadyCount
+				}
 				data.MessageCount += channel.MessageCount
 				data.TimeoutCount += channel.TimeoutCount
 				data.RequeueCount += channel.RequeueCount
@@ -782,7 +1311,38 @@ func (n *NSQTop) processStats(allStats []StatsResponse) ([]*ChannelData, Totals)
 		channels = append(channels, data)
 	}
 
-	return channels, totals
+	// Per-topic rollups for the topic view.
+	topicData := make(map[string]*TopicData)
+	for _, data := range channelData {
+		td, ok := topicData[data.Topic]
+		if !ok {
+			td = &TopicData{Topic: data.Topic}
+			topicData[data.Topic] = td
+		}
+		td.ChannelCount++
+		td.ConnectionCount += data.ClientCount
+		td.ReadyCount += data.ReadyCount
+		td.Depth += data.Depth
+		td.InFlightCount += data.InFlightCount
+	}
+	for name, msgs := range topicMessages {
+		td, ok := topicData[name]
+		if !ok {
+			// Topic exists with no channels yet — still worth showing.
+			td = &TopicData{Topic: name}
+			topicData[name] = td
+		}
+		td.MessageCount = msgs
+		td.IncomingPerSecond = topicIncoming[name]
+		td.IncomingPerMinute = td.IncomingPerSecond * 60
+	}
+
+	var topics []*TopicData
+	for _, t := range topicData {
+		topics = append(topics, t)
+	}
+
+	return channels, topics, totals
 }
 
 // smoothRates turns cumulative counters into a per-second growth rate, fed
@@ -809,14 +1369,13 @@ func (n *NSQTop) smoothRates(current, previous map[string]int64, prevEMA map[str
 	return out
 }
 
-func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []string) {
-	// Calculate total depth
+func (n *NSQTop) updateUI(channels []*ChannelData, topics []*TopicData, totals Totals, nodeURLs []string) {
+	// Cluster-wide totals stay the same regardless of view.
 	totalDepth := 0
 	for _, channel := range channels {
 		totalDepth += channel.Depth
 	}
 
-	// Update summary
 	lookupDisplay := strings.Join(n.lookupURLs, ", ")
 	if len(n.lookupURLs) > 3 {
 		lookupDisplay = fmt.Sprintf("%d servers", len(n.lookupURLs))
@@ -825,7 +1384,6 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 		lookupDisplay = "nsqd directly"
 	}
 
-	// Format nsqd servers list (strip the scheme for display)
 	var nsqdServers []string
 	for _, u := range nodeURLs {
 		nsqdServers = append(nsqdServers, strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://"))
@@ -835,17 +1393,42 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 		nsqdDisplay = fmt.Sprintf("%d nsqd nodes", len(nsqdServers))
 	}
 
-	// Apply the active substring filter to the displayed rows; cluster-wide
-	// totals above stay global regardless of the filter.
-	display := filterChannels(channels, n.filterText)
-	channelsField := strconv.Itoa(len(channels))
-	if n.filterText != "" {
-		channelsField = fmt.Sprintf("%d/%d matching %q", len(display), len(channels), n.filterText)
-	}
-
 	sortDirArrow := "▲"
 	if n.sortDesc {
 		sortDirArrow = "▼"
+	}
+
+	// Filter the displayed rows for the active view. Cluster totals above stay
+	// global regardless of the filter. Detail views don't filter — the lists
+	// are short and the drill target is already the scope.
+	var displayChannels []*ChannelData
+	var displayTopics []*TopicData
+	var displayTopicDetail []*TopicNodeRow
+	var displayClientDetail []*ClientRow
+	var rowsLabel, rowsField string
+	switch n.viewMode {
+	case viewTopics:
+		displayTopics = filterTopics(topics, n.filterText)
+		rowsLabel = "Topics"
+		rowsField = strconv.Itoa(len(topics))
+		if n.filterText != "" {
+			rowsField = fmt.Sprintf("%d/%d matching %q", len(displayTopics), len(topics), n.filterText)
+		}
+	case viewTopicDetail:
+		displayTopicDetail = aggregateTopicDetail(n.lastRaw, n.drillTarget)
+		rowsLabel = "Nodes"
+		rowsField = strconv.Itoa(len(displayTopicDetail))
+	case viewChannelDetail:
+		displayClientDetail = aggregateChannelDetail(n.lastRaw, n.drillTarget)
+		rowsLabel = "Clients"
+		rowsField = strconv.Itoa(len(displayClientDetail))
+	default: // viewChannels
+		displayChannels = filterChannels(channels, n.filterText)
+		rowsLabel = "Channels"
+		rowsField = strconv.Itoa(len(channels))
+		if n.filterText != "" {
+			rowsField = fmt.Sprintf("%d/%d matching %q", len(displayChannels), len(channels), n.filterText)
+		}
 	}
 
 	// When a baseline is active, Total Msgs and the cumulative columns read as a
@@ -856,35 +1439,34 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 		totalMsgs = sub(totals.MessageCount, n.baseTotalMsgs)
 		msgsLabel = fmt.Sprintf("Δ Msgs (since %s)", n.baselineAt.Format("15:04:05"))
 	}
-	// Lead with the cluster label when one is set, so you can tell instances
-	// apart at a glance when running several side by side.
 	clusterPrefix := ""
 	if n.clusterName != "" {
 		clusterPrefix = fmt.Sprintf("[%s] ", n.clusterName)
 	}
+	columns := n.activeColumns()
 	summaryText := fmt.Sprintf(
 		"[#7aa2f7]%sNSQ Top - %s - Connected to %s[-]\n"+
-			"[#e0af68]Total Depth: %s | Total In-Flight: %s | Channels: %s[-]\n"+
+			"[#e0af68]Total Depth: %s | Total In-Flight: %s | %s: %s[-]\n"+
 			"[#bb9af7]%s: %s | Rate: %s/s, %s/m[-]\n"+
 			"[#9ece6a]NSQd Servers: %s[-]\n"+
-			"[#565f89]Sort: %s %s  •  Refresh: %s  •  / filter  •  ←/→ sort  •  Enter reverse  •  − faster / + slower  •  c zero / C clear  •  Ctrl+C quit[-]",
+			"[#565f89]Sort: %s %s  •  Refresh: %s  •  Tab cycle  •  Enter drill  •  Esc back  •  / filter  •  ←/→ col  •  Space rev  •  −/+ rate  •  c/C zero  •  ^C quit[-]",
 		clusterPrefix,
 		time.Now().Format("2006-01-02 15:04:05"),
 		lookupDisplay,
 		formatNumber(totalDepth),
 		formatNumber(totals.Inflight),
-		channelsField,
+		rowsLabel, rowsField,
 		msgsLabel,
 		formatNumber64(totalMsgs),
 		formatRate(totals.IncomingPerSec, 1),
 		formatRate(totals.IncomingPerSec*60, 0),
 		nsqdDisplay,
-		columnTitles[n.sortColumn], sortDirArrow,
+		columns[n.sortColumn], sortDirArrow,
 		formatInterval(n.getInterval()),
 	)
 	n.summary.SetText(summaryText)
 
-	// Render the in-flight trend across the full width of its panel.
+	// Render the traffic trend across the full width of its panel.
 	trendWidth := SparklineLength
 	if _, _, w, _ := n.trend.GetInnerRect(); w > 0 {
 		trendWidth = w
@@ -895,31 +1477,28 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 	}
 	n.trend.SetText("[#7dcfff]" + generateSparkline(history) + "[-]")
 
-	// Sort the displayed rows by the active column/direction.
-	n.sortChannels(display)
-
-	// Remember the full (unfiltered) snapshot so a key press can re-sort or
-	// re-filter between refresh ticks.
+	// Remember the full (unfiltered) snapshot so a key press can re-sort,
+	// re-filter, or flip views between refresh ticks.
 	n.lastChannels = channels
+	n.lastTopics = topics
 	n.lastTotals = totals
 	n.lastNodes = nodeURLs
 
-	// Update table
 	n.table.Clear()
 
-	// Headers: bold, underlined accent text (no grid). The first column is
-	// left-aligned; numeric columns are right-aligned to sit over their values.
-	// An arrow marks the active sort column.
-	for i, header := range columnTitles {
-		// Mark the cumulative columns as deltas while a baseline is active.
-		if n.baselineActive && i >= 5 {
+	// Headers shared between views: bold, underlined accent text. An arrow
+	// marks the active sort column. Per-view alignment and delta-marking
+	// happens via the helpers below.
+	deltaCol := n.deltaColumns()
+	for i, header := range columns {
+		if n.baselineActive && deltaCol[i] {
 			header = "Δ " + header
 		}
 		if i == n.sortColumn {
 			header = header + " " + sortDirArrow
 		}
 		align := tview.AlignRight
-		if i == 0 {
+		if n.columnLeftAligned(i) {
 			align = tview.AlignLeft
 		}
 		cell := tview.NewTableCell(header).
@@ -927,53 +1506,37 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 			SetAttributes(tcell.AttrBold | tcell.AttrUnderline).
 			SetTextColor(colorAccent).
 			SetSelectable(false)
+		// Tint the active sort column so the eye can find it at a glance,
+		// alongside the existing ▲/▼ marker. Data cells get the same tint
+		// below for one continuous stripe.
+		if i == n.sortColumn {
+			cell.SetBackgroundColor(colorColumnTint)
+		}
 		n.table.SetCell(0, i, cell)
 	}
 
-	// Data rows
-	for i, channel := range display {
-		row := i + 1
-		topicChannel := fmt.Sprintf("%s/%s", channel.Topic, channel.Channel)
+	switch n.viewMode {
+	case viewTopics:
+		n.sortTopics(displayTopics)
+		n.renderTopicRows(displayTopics)
+	case viewTopicDetail:
+		n.sortTopicDetail(displayTopicDetail)
+		n.renderTopicDetailRows(displayTopicDetail)
+	case viewChannelDetail:
+		n.sortClientDetail(displayClientDetail)
+		n.renderClientDetailRows(displayClientDetail)
+	default: // viewChannels
+		n.sortChannels(displayChannels)
+		n.renderChannelRows(displayChannels)
+	}
 
-		// Topic/Channel
-		n.table.SetCell(row, 0, tview.NewTableCell(topicChannel))
-
-		// Depth with color coding
-		depthCell := tview.NewTableCell(formatNumber(channel.Depth)).SetAlign(tview.AlignRight)
-		if channel.Depth >= DepthCritThreshold {
-			depthCell.SetTextColor(colorCrit)
-		} else if channel.Depth >= DepthWarnThreshold {
-			depthCell.SetTextColor(colorWarn)
-		} else {
-			depthCell.SetTextColor(colorOK)
+	// Stripe the active sort column over the data rows so it reads as one
+	// continuous tint top-to-bottom. Selected-row highlighting still wins at
+	// the intersection, which is the behavior we want.
+	for r := 1; r < n.table.GetRowCount(); r++ {
+		if c := n.table.GetCell(r, n.sortColumn); c != nil {
+			c.SetBackgroundColor(colorColumnTint)
 		}
-		n.table.SetCell(row, 1, depthCell)
-
-		// In-Flight
-		n.table.SetCell(row, 2, tview.NewTableCell(formatNumber(channel.InFlightCount)).SetAlign(tview.AlignRight))
-
-		// Incoming per second
-		n.table.SetCell(row, 3, tview.NewTableCell(formatRate(channel.IncomingPerSecond, 1)).SetAlign(tview.AlignRight))
-
-		// Incoming per minute
-		n.table.SetCell(row, 4, tview.NewTableCell(formatRate(channel.IncomingPerMinute, 0)).SetAlign(tview.AlignRight))
-
-		// Processed (cumulative messages handled by the channel, or the delta
-		// since the baseline when one is active).
-		n.table.SetCell(row, 5, tview.NewTableCell(formatNumber64(n.dispProcessed(channel))).SetAlign(tview.AlignRight))
-
-		// Timeouts and Requeues, with a ▲rate growth marker when climbing.
-		timeoutCell := tview.NewTableCell(formatGrowth(n.dispTimeout(channel), channel.TimeoutRate)).SetAlign(tview.AlignRight)
-		if channel.TimeoutRate >= 0.05 {
-			timeoutCell.SetTextColor(colorCrit)
-		}
-		n.table.SetCell(row, 6, timeoutCell)
-
-		requeueCell := tview.NewTableCell(formatGrowth(n.dispRequeue(channel), channel.RequeueRate)).SetAlign(tview.AlignRight)
-		if channel.RequeueRate >= 0.05 {
-			requeueCell.SetTextColor(colorWarn)
-		}
-		n.table.SetCell(row, 7, requeueCell)
 	}
 
 	// Pin the header row so it stays visible while scrolling. Snap to the top
@@ -982,7 +1545,179 @@ func (n *NSQTop) updateUI(channels []*ChannelData, totals Totals, nodeURLs []str
 	n.table.SetFixed(1, 0)
 	if n.scrollTop {
 		n.table.ScrollToBeginning()
+		if n.table.GetRowCount() > 1 {
+			n.table.Select(1, 0)
+		}
 		n.scrollTop = false
+	}
+}
+
+// deltaColumns returns a map column-index -> true for the columns that
+// represent cumulative counters; their headers gain a Δ prefix when a baseline
+// is active.
+func (n *NSQTop) deltaColumns() map[int]bool {
+	switch n.viewMode {
+	case viewTopics:
+		return map[int]bool{8: true} // Messages
+	case viewChannels:
+		return map[int]bool{6: true, 7: true, 8: true} // Processed, Timeouts, Requeues
+	default:
+		// Detail views show point-in-time counters; baseline doesn't apply.
+		return nil
+	}
+}
+
+// columnLeftAligned reports whether the column at index i holds text (and
+// should be left-aligned) rather than a number.
+func (n *NSQTop) columnLeftAligned(i int) bool {
+	if n.viewMode == viewChannelDetail {
+		// Client | Hostname | Remote | State are text; everything else is numeric.
+		return i <= 3
+	}
+	return i == 0
+}
+
+func (n *NSQTop) renderChannelRows(display []*ChannelData) {
+	for i, channel := range display {
+		row := i + 1
+		topicChannel := fmt.Sprintf("%s/%s", channel.Topic, channel.Channel)
+		n.table.SetCell(row, 0, tview.NewTableCell(topicChannel).SetReference(topicChannel))
+
+		depthCell := tview.NewTableCell(formatNumber(channel.Depth)).SetAlign(tview.AlignRight)
+		colorDepth(depthCell, channel.Depth)
+		n.table.SetCell(row, 1, depthCell)
+
+		n.table.SetCell(row, 2, tview.NewTableCell(formatNumber(channel.InFlightCount)).SetAlign(tview.AlignRight))
+
+		// Ready: zero with active consumers is a "consumers paused / not asking
+		// for more" signal — color it the same as a stalled rate.
+		readyCell := tview.NewTableCell(formatNumber64(channel.ReadyCount)).SetAlign(tview.AlignRight)
+		if channel.ReadyCount == 0 && channel.ClientCount > 0 {
+			readyCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 3, readyCell)
+
+		n.table.SetCell(row, 4, tview.NewTableCell(formatRate(channel.IncomingPerSecond, 1)).SetAlign(tview.AlignRight))
+		n.table.SetCell(row, 5, tview.NewTableCell(formatRate(channel.IncomingPerMinute, 0)).SetAlign(tview.AlignRight))
+		n.table.SetCell(row, 6, tview.NewTableCell(formatNumber64(n.dispProcessed(channel))).SetAlign(tview.AlignRight))
+
+		timeoutCell := tview.NewTableCell(formatGrowth(n.dispTimeout(channel), channel.TimeoutRate)).SetAlign(tview.AlignRight)
+		if channel.TimeoutRate >= 0.05 {
+			timeoutCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 7, timeoutCell)
+
+		requeueCell := tview.NewTableCell(formatGrowth(n.dispRequeue(channel), channel.RequeueRate)).SetAlign(tview.AlignRight)
+		if channel.RequeueRate >= 0.05 {
+			requeueCell.SetTextColor(colorWarn)
+		}
+		n.table.SetCell(row, 8, requeueCell)
+	}
+}
+
+func (n *NSQTop) renderTopicRows(display []*TopicData) {
+	for i, t := range display {
+		row := i + 1
+		n.table.SetCell(row, 0, tview.NewTableCell(t.Topic).SetReference(t.Topic))
+		n.table.SetCell(row, 1, tview.NewTableCell(formatNumber(t.ChannelCount)).SetAlign(tview.AlignRight))
+
+		// No connections is a "no consumers" signal; flag it the same way as a
+		// high depth so a topic backing up with zero consumers stands out.
+		connCell := tview.NewTableCell(formatNumber(t.ConnectionCount)).SetAlign(tview.AlignRight)
+		if t.ConnectionCount == 0 && t.ChannelCount > 0 {
+			connCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 2, connCell)
+
+		depthCell := tview.NewTableCell(formatNumber(t.Depth)).SetAlign(tview.AlignRight)
+		colorDepth(depthCell, t.Depth)
+		n.table.SetCell(row, 3, depthCell)
+
+		n.table.SetCell(row, 4, tview.NewTableCell(formatNumber(t.InFlightCount)).SetAlign(tview.AlignRight))
+
+		readyCell := tview.NewTableCell(formatNumber64(t.ReadyCount)).SetAlign(tview.AlignRight)
+		if t.ReadyCount == 0 && t.ConnectionCount > 0 {
+			readyCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 5, readyCell)
+
+		n.table.SetCell(row, 6, tview.NewTableCell(formatRate(t.IncomingPerSecond, 1)).SetAlign(tview.AlignRight))
+		n.table.SetCell(row, 7, tview.NewTableCell(formatRate(t.IncomingPerMinute, 0)).SetAlign(tview.AlignRight))
+		n.table.SetCell(row, 8, tview.NewTableCell(formatNumber64(n.dispTopicMsgs(t))).SetAlign(tview.AlignRight))
+	}
+}
+
+// renderTopicDetailRows writes one row per nsqd node hosting the drilled-into
+// topic.
+func (n *NSQTop) renderTopicDetailRows(display []*TopicNodeRow) {
+	for i, r := range display {
+		row := i + 1
+		n.table.SetCell(row, 0, tview.NewTableCell(r.Display))
+		n.table.SetCell(row, 1, tview.NewTableCell(formatNumber(r.ChannelCount)).SetAlign(tview.AlignRight))
+
+		depthCell := tview.NewTableCell(formatNumber(r.Depth)).SetAlign(tview.AlignRight)
+		colorDepth(depthCell, r.Depth)
+		n.table.SetCell(row, 2, depthCell)
+
+		n.table.SetCell(row, 3, tview.NewTableCell(formatNumber(r.InFlightCount)).SetAlign(tview.AlignRight))
+
+		connCell := tview.NewTableCell(formatNumber(r.ClientCount)).SetAlign(tview.AlignRight)
+		if r.ClientCount == 0 && r.ChannelCount > 0 {
+			connCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 4, connCell)
+
+		readyCell := tview.NewTableCell(formatNumber64(r.ReadyCount)).SetAlign(tview.AlignRight)
+		if r.ReadyCount == 0 && r.ClientCount > 0 {
+			readyCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 5, readyCell)
+
+		n.table.SetCell(row, 6, tview.NewTableCell(formatNumber64(r.MessageCount)).SetAlign(tview.AlignRight))
+	}
+}
+
+// renderClientDetailRows writes one row per consumer connection on the
+// drilled-into channel.
+func (n *NSQTop) renderClientDetailRows(display []*ClientRow) {
+	for i, c := range display {
+		row := i + 1
+		label := c.ClientID
+		if label == "" {
+			label = c.RemoteAddress
+		}
+		n.table.SetCell(row, 0, tview.NewTableCell(label))
+		n.table.SetCell(row, 1, tview.NewTableCell(c.Hostname))
+		n.table.SetCell(row, 2, tview.NewTableCell(c.RemoteAddress))
+
+		stateCell := tview.NewTableCell(clientStateLabel(c.State))
+		if c.State != 3 { // 3 = Subscribed; anything else means not actively consuming
+			stateCell.SetTextColor(colorWarn)
+		}
+		n.table.SetCell(row, 3, stateCell)
+
+		readyCell := tview.NewTableCell(formatNumber64(c.ReadyCount)).SetAlign(tview.AlignRight)
+		if c.ReadyCount == 0 && c.State == 3 {
+			readyCell.SetTextColor(colorCrit)
+		}
+		n.table.SetCell(row, 4, readyCell)
+
+		n.table.SetCell(row, 5, tview.NewTableCell(formatNumber64(c.InFlightCount)).SetAlign(tview.AlignRight))
+		n.table.SetCell(row, 6, tview.NewTableCell(formatNumber64(c.MessageCount)).SetAlign(tview.AlignRight))
+		n.table.SetCell(row, 7, tview.NewTableCell(formatNumber64(c.RequeueCount)).SetAlign(tview.AlignRight))
+		n.table.SetCell(row, 8, tview.NewTableCell(formatConnectedFor(c.ConnectTs)).SetAlign(tview.AlignRight))
+	}
+}
+
+// colorDepth applies the standard depth color coding used in both views.
+func colorDepth(cell *tview.TableCell, depth int) {
+	switch {
+	case depth >= DepthCritThreshold:
+		cell.SetTextColor(colorCrit)
+	case depth >= DepthWarnThreshold:
+		cell.SetTextColor(colorWarn)
+	default:
+		cell.SetTextColor(colorOK)
 	}
 }
 

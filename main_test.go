@@ -81,8 +81,8 @@ func TestSortChannels(t *testing.T) {
 		{"depth asc", sortColumnDepth, false, []string{"a", "c", "b"}},
 		{"name asc", 0, false, []string{"a", "b", "c"}},
 		{"inflight desc", 2, true, []string{"c", "a", "b"}},
-		{"in/sec desc", 3, true, []string{"b", "c", "a"}},
-		{"processed asc", 5, false, []string{"a", "c", "b"}},
+		{"in/sec desc", 4, true, []string{"b", "c", "a"}},
+		{"processed asc", 6, false, []string{"a", "c", "b"}},
 	}
 
 	for _, test := range tests {
